@@ -1,0 +1,157 @@
+// Prisma schema for AI役員会 MVP
+// SQLite first; structured for future PostgreSQL migration.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Company {
+  id           String   @id @default(cuid())
+  name         String
+  philosophy   String
+  vision       String
+  /// string[]
+  values       Json
+  culture      String
+  principles   String
+  prohibitions String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  boardMembers BoardMember[]
+  projects     Project[]
+}
+
+model BoardMember {
+  id            String   @id @default(cuid())
+  companyId     String
+  /// ceo | cfo | marketing | operations | cto | customer | redteam
+  roleKey       String
+  title         String
+  description   String   @default("")
+  /// string[]
+  priorities    Json
+  /// string[] | null
+  checkItems    Json?
+  /// string[]
+  behaviorRules Json
+  sortOrder     Int      @default(0)
+  isChairperson Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  company    Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  statements Statement[]
+
+  @@index([companyId])
+  @@index([roleKey])
+}
+
+model Project {
+  id               String   @id @default(cuid())
+  companyId        String
+  title            String
+  background       String   @default("")
+  problem          String   @default("")
+  content          String   @default("")
+  targetCustomer   String   @default("")
+  expectedEffect   String   @default("")
+  estimatedCost    String   @default("")
+  constraints      String   @default("")
+  discussionPoints String   @default("")
+  /// draft | in_review | decided
+  status           String   @default("draft")
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  company  Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  meetings Meeting[]
+
+  @@index([companyId])
+  @@index([status])
+}
+
+model Meeting {
+  id          String   @id @default(cuid())
+  projectId   String
+  /// agenda | initial_review | rebuttal | interim | awaiting_answer | re_review | decided | failed
+  status      String   @default("agenda")
+  /// AGENDA | INITIAL_REVIEW | REBUTTAL | INTERIM | PROPOSER_ANSWER | RE_REVIEW | DECISION
+  currentStep String   @default("AGENDA")
+  errorMessage String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  rounds  MeetingRound[]
+  decision Decision?
+
+  @@index([projectId])
+  @@index([status])
+}
+
+model MeetingRound {
+  id          String   @id @default(cuid())
+  meetingId   String
+  /// AGENDA | INITIAL_REVIEW | REBUTTAL | INTERIM | PROPOSER_ANSWER | RE_REVIEW | DECISION
+  step        String
+  roundNumber Int
+  /// structured summary when applicable
+  summary     Json?
+  createdAt   DateTime @default(now())
+
+  meeting    Meeting     @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  statements Statement[]
+
+  @@index([meetingId])
+  @@index([step])
+}
+
+model Statement {
+  id             String   @id @default(cuid())
+  meetingRoundId String
+  boardMemberId  String?
+  /// board_member | proposer | system
+  speakerType    String
+  /// approve | conditional | reject | hold | null
+  stance         String?
+  /// structured AI / user payload
+  content        Json
+  rawText        String?
+  createdAt      DateTime @default(now())
+
+  meetingRound MeetingRound @relation(fields: [meetingRoundId], references: [id], onDelete: Cascade)
+  boardMember  BoardMember? @relation(fields: [boardMemberId], references: [id], onDelete: SetNull)
+
+  @@index([meetingRoundId])
+  @@index([boardMemberId])
+}
+
+model Decision {
+  id              String   @id @default(cuid())
+  meetingId       String   @unique
+  /// approved | conditional | reconsider | rejected
+  result          String
+  /// string[]
+  conditions      Json?
+  /// string[]
+  reasons         Json?
+  /// string[]
+  strengths       Json?
+  /// string[]
+  remainingRisks  Json?
+  /// string[]
+  nextActions     Json?
+  /// string[]
+  kpisToVerify    Json?
+  /// full structured CEO decision payload
+  content         Json
+  createdAt       DateTime @default(now())
+
+  meeting Meeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+}
