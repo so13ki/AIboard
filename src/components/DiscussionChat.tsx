@@ -94,6 +94,13 @@ type OpenTopic = {
   note?: string | null;
 };
 
+type CeoQuestion = {
+  id: string;
+  text: string;
+  status: "OPEN" | "ANSWERED" | "RESOLVED" | "PARKED";
+  note?: string | null;
+};
+
 type WallSummary = {
   format?: string;
   messages?: ChatMessage[];
@@ -105,6 +112,10 @@ type WallSummary = {
   pendingPlanUpdate?: PendingPlanUpdate | null;
   openTopics?: OpenTopic[];
   priorityIssues?: string[];
+  activeTheme?: string;
+  activeThemeLabel?: string;
+  closedThemes?: string[];
+  ceoQuestions?: CeoQuestion[];
   decisions?: string[];
   rejectedItems?: string[];
 };
@@ -265,6 +276,29 @@ function parseSummary(raw: unknown): WallSummary {
           .filter((d): d is string => typeof d === "string" && d.trim().length > 0)
           .map((d) => d.slice(0, 80))
           .slice(0, 4)
+      : [],
+    activeTheme:
+      typeof data.activeTheme === "string" ? data.activeTheme : undefined,
+    activeThemeLabel:
+      typeof data.activeThemeLabel === "string"
+        ? data.activeThemeLabel
+        : undefined,
+    closedThemes: Array.isArray(data.closedThemes)
+      ? (data.closedThemes as unknown[]).filter(
+          (t): t is string => typeof t === "string",
+        )
+      : [],
+    ceoQuestions: Array.isArray(data.ceoQuestions)
+      ? (data.ceoQuestions as CeoQuestion[]).filter(
+          (q) =>
+            q &&
+            typeof q.id === "string" &&
+            typeof q.text === "string" &&
+            (q.status === "OPEN" ||
+              q.status === "ANSWERED" ||
+              q.status === "RESOLVED" ||
+              q.status === "PARKED"),
+        )
       : [],
     decisions: Array.isArray(data.decisions)
       ? (data.decisions as unknown[])
@@ -653,7 +687,7 @@ export function DiscussionChat({
           AI壁打ち会議 — ライブ役員会
         </div>
         <p className="mt-1 text-xs text-stone-600">
-          役員は会議メモリ（決定・却下・論点）を前提に発言します。同じ提案の繰り返しは禁止。いつでも下の入力から割り込めます。
+          役員同士の議論を深めます。企画者は必要なときだけ。同じ提案の繰り返しは禁止。いつでも下の入力から割り込めます。
           {wall.ended ? (
             <span className="ml-2 font-medium text-emerald-800">（終了）</span>
           ) : null}
@@ -661,8 +695,25 @@ export function DiscussionChat({
             <span className="ml-2 font-medium text-amber-800">（一時停止中）</span>
           ) : null}
         </p>
+        {wall.activeThemeLabel || wall.activeTheme ? (
+          <div className="mt-3 rounded border border-stone-800 bg-stone-900 px-3 py-2 text-stone-50">
+            <div className="text-[11px] font-semibold tracking-wide text-stone-300">
+              現在の論点（1つだけ）
+            </div>
+            <div className="mt-1 text-base font-semibold">
+              {wall.activeThemeLabel ?? wall.activeTheme}
+            </div>
+            <p className="mt-1 text-[11px] text-stone-400">
+              順: 利益・ROI → 顧客 → 運用 → ブランド。別論点は後ほど。
+              {wall.closedThemes && wall.closedThemes.length > 0
+                ? ` 済: ${wall.closedThemes.join(", ")}`
+                : ""}
+            </p>
+          </div>
+        ) : null}
         {(wall.decisions && wall.decisions.length > 0) ||
         (wall.rejectedItems && wall.rejectedItems.length > 0) ||
+        (wall.ceoQuestions && wall.ceoQuestions.length > 0) ||
         (wall.priorityIssues && wall.priorityIssues.length > 0) ||
         (wall.openTopics && wall.openTopics.length > 0) ? (
           <div className="mt-3 space-y-2 rounded border border-stone-200 bg-stone-50 px-3 py-2">
@@ -700,6 +751,41 @@ export function DiscussionChat({
                       {item}
                     </li>
                   ))}
+                </ul>
+              </div>
+            ) : null}
+            {wall.ceoQuestions && wall.ceoQuestions.length > 0 ? (
+              <div>
+                <div className="text-[11px] font-medium text-indigo-900">
+                  CEO質問ボード
+                </div>
+                <ul className="mt-1.5 flex flex-wrap gap-2">
+                  {wall.ceoQuestions
+                    .filter((q) => q.status !== "PARKED")
+                    .map((q) => {
+                      const style =
+                        q.status === "RESOLVED"
+                          ? "border-emerald-300 bg-emerald-50 text-emerald-900 line-through decoration-emerald-400/70"
+                          : q.status === "ANSWERED"
+                            ? "border-sky-300 bg-sky-50 text-sky-950"
+                            : "border-indigo-300 bg-indigo-50 text-indigo-950";
+                      const label =
+                        q.status === "RESOLVED"
+                          ? "解決"
+                          : q.status === "ANSWERED"
+                            ? "回答済"
+                            : "未回答";
+                      return (
+                        <li
+                          key={q.id}
+                          className={`max-w-full rounded border px-2 py-1 text-xs ${style}`}
+                          title={q.note ?? undefined}
+                        >
+                          <span className="mr-1 opacity-70">[{label}]</span>
+                          {q.text}
+                        </li>
+                      );
+                    })}
                 </ul>
               </div>
             ) : null}

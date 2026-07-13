@@ -125,8 +125,11 @@ export async function runDiscussionUtterance(args: {
   decisions: string[];
   rejectedItems: string[];
   openTopics: unknown[];
+  ceoQuestions?: unknown[];
   proposerAnswers: string[];
   chairNotes: string[];
+  activeTheme?: string | null;
+  activeThemeLabel?: string | null;
   signal?: AbortSignal;
 }): Promise<DiscussionUtteranceOutput> {
   return generateStructuredJson({
@@ -142,8 +145,11 @@ export async function runDiscussionUtterance(args: {
       decisions: args.decisions,
       rejectedItems: args.rejectedItems,
       openTopics: args.openTopics,
+      ceoQuestions: args.ceoQuestions,
       proposerAnswers: args.proposerAnswers,
       chairNotes: args.chairNotes,
+      activeTheme: args.activeTheme,
+      activeThemeLabel: args.activeThemeLabel,
     }),
     schema: discussionUtteranceSchema,
     schemaName: "discussionUtterance",

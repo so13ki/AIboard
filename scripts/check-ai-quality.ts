@@ -324,13 +324,25 @@ function testSchemas() {
       { id: "parent", label: "保護者説明", status: "unresolved", note: null },
     ],
     priorityIssues: ["価格設定", "現場運用", "スタッフ教育", "KPI"],
+    ceoQuestions: [
+      { id: "q1", text: "価格は無料から試す？", status: "RESOLVED", note: "無料パイロットで合意" },
+      { id: "q2", text: "スタッフ教育はどうする？", status: "OPEN", note: null },
+      { id: "q3", text: "KPIは何を見る？", status: "ANSWERED", note: "継続率を見る" },
+    ],
+    routingKind: "brand",
+    activeTheme: "profit",
+    themeAction: "continue",
     decisions: ["紙運用", "マニュアルは作らない"],
     rejectedItems: ["アプリ化", "詳細マニュアル作成"],
     repetitionDetected: false,
   });
   assert.equal(fac.action, "nominate");
+  assert.equal(fac.routingKind, "brand");
+  assert.equal(fac.activeTheme, "profit");
+  assert.equal(fac.themeAction, "continue");
   assert.equal(fac.openTopics.filter((t) => t.status !== "resolved").length, 5);
   assert.equal(fac.priorityIssues.length, 4);
+  assert.equal(fac.ceoQuestions.filter((q) => q.status === "RESOLVED").length, 1);
   assert.equal(fac.decisions.length, 2);
   assert.equal(fac.rejectedItems[0], "アプリ化");
 
@@ -365,6 +377,14 @@ function testSchemas() {
     moveType: "counter",
   });
   assert.equal(utter.moveType, "counter");
+
+  const accept = discussionUtteranceSchema.parse({
+    text: "なるほど、既存判定なら運用は増えない。次はラウンジ混雑時の動線が気になる。",
+    addressTo: "all",
+    addressRoleKey: null,
+    moveType: "accept",
+  });
+  assert.equal(accept.moveType, "accept");
 
   const planUpdate = planUpdateDetectionSchema.parse({
     planUpdated: true,

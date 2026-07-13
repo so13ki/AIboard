@@ -657,6 +657,22 @@ export const discussionTopicSchema = z.object({
   note: z.string().max(120).nullable().optional(),
 });
 
+/** CEO-managed questions — never re-ask RESOLVED. */
+export const ceoQuestionStatusSchema = z.enum([
+  "OPEN",
+  "ANSWERED",
+  "RESOLVED",
+  "PARKED",
+]);
+
+export const ceoQuestionSchema = z.object({
+  id: z.string().min(1).max(40),
+  text: z.string().min(1).max(120),
+  status: ceoQuestionStatusSchema,
+  /** Answer excerpt, follow-up reason, or park reason */
+  note: z.string().max(120).nullable().optional(),
+});
+
 export const discussionFacilitatorSchema = z.object({
   action: z.enum([
     "nominate",
@@ -672,6 +688,43 @@ export const discussionFacilitatorSchema = z.object({
   /** rare_interrupt: who barges in after the nominated speaker (optional) */
   interruptRoleKey: z.string().nullable().optional(),
   /**
+   * Content-based routing category (not job-title routing).
+   * Missing/unknown defaults to empty-safe handling.
+   */
+  routingKind: z.preprocess(
+    (value) => (typeof value === "string" ? value : null),
+    z
+      .enum([
+        "plan_content",
+        "revenue_cost_premise",
+        "roi_calc",
+        "tech_feasibility",
+        "operations",
+        "customer_psychology",
+        "brand",
+        "other",
+      ])
+      .nullable()
+      .optional(),
+  ),
+  /**
+   * Single active discussion theme. Only one theme at a time.
+   * Sequence: profit → customer → operations → brand
+   */
+  activeTheme: z.preprocess((value) => {
+    if (value === "" || value === undefined) return null;
+    return value;
+  }, z.enum(["profit", "customer", "operations", "brand"]).nullable().optional()),
+  /**
+   * continue: stay on activeTheme
+   * park_aside: off-theme remark → park with 「後ほど」
+   * close_and_advance: declare theme done and move to next
+   */
+  themeAction: z.preprocess((value) => {
+    if (value === "" || value === undefined) return "continue";
+    return value;
+  }, z.enum(["continue", "park_aside", "close_and_advance"]).optional()),
+  /**
    * Full CEO issue board (all unresolved + resolved). Soft-capped.
    * Meeting may propose_end only when every topic is resolved.
    */
@@ -683,6 +736,16 @@ export const discussionFacilitatorSchema = z.object({
   priorityIssues: z.preprocess(
     (value) => (Array.isArray(value) ? value : []),
     cappedArray(z.string().min(1).max(80), 4),
+  ),
+  /**
+   * CEO question board. Soft-capped.
+   * OPEN → (answer) → ANSWERED → (sufficient?) → RESOLVED
+   * or (insufficient) → new distinct OPEN follow-up only.
+   * RESOLVED / same ANSWERED text must never be re-asked.
+   */
+  ceoQuestions: z.preprocess(
+    (value) => (Array.isArray(value) ? value : []),
+    cappedArray(ceoQuestionSchema, 12),
   ),
   /** Confirmed premises everyone must respect going forward. */
   decisions: z.preprocess(
@@ -750,6 +813,10 @@ export const discussionUtteranceSchema = z
       "challenge_premise",
       "expand",
       "brake",
+      /** Sufficient answer accepted; premise updated */
+      "accept",
+      /** Concern closed; move to a new angle/issue */
+      "advance",
     ]),
   })
   .superRefine((value, ctx) => {
@@ -758,7 +825,7 @@ export const discussionUtteranceSchema = z
         code: "custom",
         path: ["text"],
         message:
-          "レビュー口調は禁止です。自然な質問・反論・別案・前提疑いに言い換えてください。",
+          "レビュー口調は禁止です。自然な質問・反論・別案・納得・次論点への前進に言い換えてください。",
       });
     }
   });
@@ -793,6 +860,8 @@ export type DiscussionFacilitatorOutput = z.infer<
   typeof discussionFacilitatorSchema
 >;
 export type DiscussionTopic = z.infer<typeof discussionTopicSchema>;
+export type CeoQuestion = z.infer<typeof ceoQuestionSchema>;
+export type CeoQuestionStatus = z.infer<typeof ceoQuestionStatusSchema>;
 export type DiscussionUtteranceOutput = z.infer<typeof discussionUtteranceSchema>;
 export type DiscussionReplyInput = z.infer<typeof discussionReplySchema>;
 export type PlanUpdateDetectionOutput = z.infer<typeof planUpdateDetectionSchema>;
