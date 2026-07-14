@@ -9,6 +9,7 @@ import {
   useState,
   startTransition,
 } from "react";
+import { addressArrowLabel } from "@/lib/meeting/speaker-routing";
 
 const ROLE_STYLES: Record<string, string> = {
   ceo: "bg-stone-800 text-white",
@@ -31,6 +32,8 @@ const MOVE_LABELS: Record<string, string> = {
   challenge_premise: "前提疑い",
   expand: "拡張",
   brake: "ブレーキ",
+  accept: "納得",
+  advance: "前進",
 };
 
 const TARGET_OPTIONS = [
@@ -64,6 +67,8 @@ type ChatMessage = {
   content?: string;
   addressTo?: string;
   addressRoleKey?: string | null;
+  targetType?: string | null;
+  targetParticipantId?: string | null;
   moveType?: string;
   kind?: string;
   messageType?: string | null;
@@ -72,6 +77,54 @@ type ChatMessage = {
     changes?: string[];
     summary?: string;
   };
+  diagnostic?: DebuggerFindingView;
+  metadata?: Record<string, unknown>;
+};
+
+type DebuggerFindingView = {
+  id: string;
+  ruleId: string;
+  severity: "info" | "warning" | "critical";
+  title: string;
+  detection: string;
+  expectedState?: string;
+  currentState?: string;
+  estimatedCauses?: Array<{ label: string; confidence: number }>;
+  improvements?: string[];
+  fixTargets?: string[];
+  cursorPrompt?: string;
+  autoRepairLabel?: string | null;
+  causes: string[];
+  impact: string;
+  recommendations: string[];
+  relatedMessageIds: string[];
+  relatedIssueIds: string[];
+  relatedPlanVersion: number | null;
+  autoRepairable: boolean;
+  repairKind: string | null;
+  status: string;
+  createdAt: string;
+  repairedAt?: string | null;
+};
+
+type DebuggerPublic = {
+  mode?: "OFF" | "PASSIVE" | "ACTIVE";
+  findings?: DebuggerFindingView[];
+  repairLog?: Array<{
+    at: string;
+    findingId: string;
+    action: string;
+    note: string;
+  }>;
+  scores?: {
+    duplicateRate?: number;
+    advanceRate?: number;
+    misrouteCount?: number;
+    proposerOverAskCount?: number;
+    autoRepairCount?: number;
+    openFindings?: number;
+  };
+  openCount?: number;
 };
 
 type PlanVersion = {
@@ -114,10 +167,12 @@ type WallSummary = {
   priorityIssues?: string[];
   activeTheme?: string;
   activeThemeLabel?: string;
-  closedThemes?: string[];
+  unresolvedIssues?: string[];
+  resolvedIssues?: string[];
   ceoQuestions?: CeoQuestion[];
   decisions?: string[];
   rejectedItems?: string[];
+  debugger?: DebuggerPublic;
 };
 
 type ThinkingState = {
@@ -149,7 +204,7 @@ function PlanUpdateCard({ msg }: { msg: ChatMessage }) {
 
   return (
     <div className="mx-auto w-full max-w-xl rounded border-2 border-dashed border-stone-800 bg-stone-100 px-4 py-3 font-mono text-sm text-stone-900">
-      <div className="text-center text-base font-semibold">📌企画更新</div>
+      <div className="text-center text-base font-semibold">企画更新</div>
       <div className="mt-1 text-center text-lg font-bold">Version{version}</div>
       <div className="mt-3 font-semibold">変更内容</div>
       <ul className="mt-1 space-y-1">
@@ -160,6 +215,228 @@ function PlanUpdateCard({ msg }: { msg: ChatMessage }) {
       <p className="mt-2 text-center text-xs text-stone-700">
         これ以降は Version{version} を前提に議論します。
       </p>
+    </div>
+  );
+}
+
+function DiagnosticCard({
+  msg,
+  onRepair,
+  busy,
+}: {
+  msg: ChatMessage;
+  onRepair: (
+    findingId: string,
+    action: "auto" | "confirm" | "ignore",
+  ) => void;
+  busy: boolean;
+}) {
+  const [showCursor, setShowCursor] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const d = msg.diagnostic;
+  const severity = d?.severity ?? "info";
+  const border =
+    severity === "critical"
+      ? "border-rose-500 bg-rose-50/90"
+      : severity === "warning"
+        ? "border-amber-500 bg-amber-50/90"
+        : "border-slate-500 bg-slate-50/90";
+  const label =
+    severity === "critical"
+      ? "Critical"
+      : severity === "warning"
+        ? "Warning"
+        : "Info";
+  const emoji =
+    severity === "critical" ? "⛔" : severity === "warning" ? "⚠" : "ℹ";
+  const status = d?.status ?? "open";
+  const ignored = status === "ignored" || Boolean(msg.metadata?.ignored);
+  const causes =
+    d?.estimatedCauses && d.estimatedCauses.length > 0
+      ? d.estimatedCauses
+      : (d?.causes ?? []).map((labelText, i) => ({
+          label: labelText,
+          confidence: Math.max(40, 90 - i * 12),
+        }));
+  const improvements =
+    d?.improvements && d.improvements.length > 0
+      ? d.improvements
+      : (d?.recommendations ?? []);
+  const fixTargets = d?.fixTargets ?? [];
+  const cursorPrompt = d?.cursorPrompt ?? "";
+
+  if (msg.messageType === "debug_summary") {
+    return (
+      <div className="my-2 border-y border-dashed border-slate-400 py-3">
+        <div className="text-[11px] font-semibold tracking-wide text-slate-500">
+          AIデバッガー · 会議品質
+        </div>
+        <pre className="mt-1 whitespace-pre-wrap font-sans text-sm text-slate-800">
+          {messageText(msg)}
+        </pre>
+      </div>
+    );
+  }
+
+  async function copyCursorPrompt() {
+    if (!cursorPrompt) return;
+    try {
+      await navigator.clipboard.writeText(cursorPrompt);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setShowCursor(true);
+    }
+  }
+
+  return (
+    <div
+      className={`my-3 rounded-none border-y-2 border-x-0 border-dashed px-0 py-0 ${border}`}
+    >
+      <div className={`border-x-2 border-dashed px-3 py-3 ${border}`}>
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-[11px] font-semibold tracking-[0.12em] text-slate-600">
+            AIデバッガー
+          </div>
+          {ignored ? (
+            <span className="text-[10px] text-slate-500">無視済</span>
+          ) : status.includes("repair") ? (
+            <span className="text-[10px] text-emerald-700">改善済み</span>
+          ) : (
+            <span className="text-[10px] text-amber-800">未対応</span>
+          )}
+        </div>
+        <div className="mt-1 text-sm font-semibold text-slate-900">
+          {emoji} {label}
+        </div>
+        <div className="mt-2 text-[11px] font-medium text-slate-500">検知</div>
+        <p className="text-xs leading-relaxed text-slate-800">
+          {d?.detection ?? messageText(msg)}
+        </p>
+        {d?.expectedState ? (
+          <>
+            <div className="mt-2 text-[11px] font-medium text-slate-500">
+              期待する状態
+            </div>
+            <p className="text-xs leading-relaxed text-slate-800">
+              {d.expectedState}
+            </p>
+          </>
+        ) : null}
+        {d?.currentState ? (
+          <>
+            <div className="mt-2 text-[11px] font-medium text-slate-500">
+              現在の状態
+            </div>
+            <p className="text-xs leading-relaxed text-slate-800">
+              {d.currentState}
+            </p>
+          </>
+        ) : null}
+        {causes.length > 0 ? (
+          <>
+            <div className="mt-2 text-[11px] font-medium text-slate-500">
+              推定原因
+            </div>
+            <ul className="mt-0.5 space-y-1">
+              {causes.map((c) => (
+                <li
+                  key={c.label}
+                  className="flex items-baseline justify-between gap-2 text-xs text-slate-800"
+                >
+                  <span>{c.label}</span>
+                  <span className="shrink-0 font-medium text-slate-600">
+                    信頼度 {c.confidence}%
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : null}
+        {improvements.length > 0 ? (
+          <>
+            <div className="mt-2 text-[11px] font-medium text-slate-500">
+              改善案
+            </div>
+            <ul className="mt-0.5 list-disc space-y-1 pl-4 text-xs text-slate-800">
+              {improvements.map((item) => (
+                <li key={item}>{item}</li>
+              ))}
+            </ul>
+          </>
+        ) : null}
+        {fixTargets.length > 0 ? (
+          <>
+            <div className="mt-2 text-[11px] font-medium text-slate-500">
+              修正対象
+            </div>
+            <div className="mt-0.5 flex flex-wrap gap-1">
+              {fixTargets.map((t) => (
+                <span
+                  key={t}
+                  className="rounded border border-slate-400 bg-white px-1.5 py-0.5 text-[10px] text-slate-800"
+                >
+                  {t}
+                </span>
+              ))}
+            </div>
+          </>
+        ) : null}
+        <div className="mt-2 text-[11px] font-medium text-slate-500">
+          自動修復
+        </div>
+        <p className="text-xs text-slate-800">
+          {d?.autoRepairable
+            ? `可能 — ${d.autoRepairLabel ?? d.repairKind ?? "安全な修復"}`
+            : "不可 — Role Prompt / Schema / プロンプト変更は手動（Cursor修正案を使用）"}
+        </p>
+        {showCursor && cursorPrompt ? (
+          <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded border border-slate-300 bg-white p-2 font-mono text-[10px] leading-relaxed text-slate-800">
+            {cursorPrompt}
+          </pre>
+        ) : null}
+        {!ignored && status === "open" ? (
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            {cursorPrompt ? (
+              <>
+                <button
+                  type="button"
+                  className="rounded border border-indigo-600 bg-indigo-50 px-2 py-0.5 text-[11px] text-indigo-950"
+                  onClick={() => setShowCursor((v) => !v)}
+                >
+                  {showCursor ? "修正候補を閉じる" : "修正候補を見る"}
+                </button>
+                <button
+                  type="button"
+                  className="rounded border border-indigo-700 bg-indigo-700 px-2 py-0.5 text-[11px] text-white"
+                  onClick={() => void copyCursorPrompt()}
+                >
+                  {copied ? "コピー済" : "Cursor修正案をコピー"}
+                </button>
+              </>
+            ) : null}
+            {d?.autoRepairable ? (
+              <button
+                type="button"
+                disabled={busy || !d}
+                className="rounded border border-emerald-700 bg-emerald-700 px-2 py-0.5 text-[11px] text-white disabled:opacity-50"
+                onClick={() => d && onRepair(d.id, "confirm")}
+              >
+                自動修復
+                {d.autoRepairLabel ? `（${d.autoRepairLabel}）` : ""}
+              </button>
+            ) : null}
+            <button
+              type="button"
+              disabled={busy || !d}
+              className="rounded border border-stone-400 bg-white px-2 py-0.5 text-[11px] text-stone-700 disabled:opacity-50"
+              onClick={() => d && onRepair(d.id, "ignore")}
+            >
+              無視
+            </button>
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -283,10 +560,17 @@ function parseSummary(raw: unknown): WallSummary {
       typeof data.activeThemeLabel === "string"
         ? data.activeThemeLabel
         : undefined,
-    closedThemes: Array.isArray(data.closedThemes)
-      ? (data.closedThemes as unknown[]).filter(
-          (t): t is string => typeof t === "string",
-        )
+    unresolvedIssues: Array.isArray(data.unresolvedIssues)
+      ? (data.unresolvedIssues as unknown[])
+          .filter((d): d is string => typeof d === "string" && d.trim().length > 0)
+          .map((d) => d.slice(0, 80))
+          .slice(0, 12)
+      : [],
+    resolvedIssues: Array.isArray(data.resolvedIssues)
+      ? (data.resolvedIssues as unknown[])
+          .filter((d): d is string => typeof d === "string" && d.trim().length > 0)
+          .map((d) => d.slice(0, 80))
+          .slice(0, 12)
       : [],
     ceoQuestions: Array.isArray(data.ceoQuestions)
       ? (data.ceoQuestions as CeoQuestion[]).filter(
@@ -310,6 +594,10 @@ function parseSummary(raw: unknown): WallSummary {
           .filter((d): d is string => typeof d === "string" && d.trim().length > 0)
           .map((d) => d.slice(0, 80))
       : [],
+    debugger:
+      data.debugger && typeof data.debugger === "object"
+        ? (data.debugger as DebuggerPublic)
+        : { mode: "PASSIVE", findings: [], repairLog: [], openCount: 0 },
   };
 }
 
@@ -338,6 +626,7 @@ export function DiscussionChat({
   const [editOpen, setEditOpen] = useState(false);
   const [editChanges, setEditChanges] = useState("");
   const [editSummary, setEditSummary] = useState("");
+  const [debugLogOpen, setDebugLogOpen] = useState(false);
 
   const speakAbortRef = useRef<AbortController | null>(null);
   const prepareAbortRef = useRef<AbortController | null>(null);
@@ -618,7 +907,15 @@ export function DiscussionChat({
       | "change_topic"
       | "proceed"
       | "confirm_end"
-      | "cancel_end",
+      | "cancel_end"
+      | "set_debugger_mode"
+      | "debugger_repair"
+      | "debugger_ignore",
+    extra?: {
+      debuggerMode?: "OFF" | "PASSIVE" | "ACTIVE";
+      findingId?: string;
+      repairAction?: "auto" | "confirm" | "ignore";
+    },
   ) {
     setBusyInterrupt(true);
     setError("");
@@ -627,7 +924,7 @@ export function DiscussionChat({
     const res = await fetch(`/api/meetings/${meetingId}/discuss/control`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, ...extra }),
     });
     const data = (await res.json()) as {
       error?: string;
@@ -647,6 +944,16 @@ export function DiscussionChat({
       autoRunningRef.current = true;
       void runLiveTurn(id);
     }
+  }
+
+  function handleDebuggerRepair(
+    findingId: string,
+    repairAction: "auto" | "confirm" | "ignore",
+  ) {
+    void runControl(
+      repairAction === "ignore" ? "debugger_ignore" : "debugger_repair",
+      { findingId, repairAction },
+    );
   }
 
   async function resolvePlan(
@@ -679,9 +986,13 @@ export function DiscussionChat({
   const planVersions = wall.planVersions ?? [];
   const currentVersion = wall.currentVersion ?? 1;
   const currentPlan = planVersions.find((v) => v.version === currentVersion);
+  const debuggerMode = wall.debugger?.mode ?? "PASSIVE";
+  const showDebugHistory =
+    debugLogOpen && debuggerMode !== "OFF";
 
   return (
-    <div className="flex min-h-[32rem] flex-col rounded border border-stone-300 bg-stone-50">
+    <div className="flex min-h-[32rem] flex-col rounded border border-stone-300 bg-stone-50 lg:flex-row">
+      <div className="flex min-w-0 flex-1 flex-col">
       <div className="border-b border-stone-300 bg-white px-4 py-3">
         <div className="text-sm font-semibold text-stone-900">
           AI壁打ち会議 — ライブ役員会
@@ -698,38 +1009,84 @@ export function DiscussionChat({
         {wall.activeThemeLabel || wall.activeTheme ? (
           <div className="mt-3 rounded border border-stone-800 bg-stone-900 px-3 py-2 text-stone-50">
             <div className="text-[11px] font-semibold tracking-wide text-stone-300">
-              現在の論点（1つだけ）
+              現在のテーマ
             </div>
             <div className="mt-1 text-base font-semibold">
               {wall.activeThemeLabel ?? wall.activeTheme}
             </div>
             <p className="mt-1 text-[11px] text-stone-400">
-              順: 利益・ROI → 顧客 → 運用 → ブランド。別論点は後ほど。
-              {wall.closedThemes && wall.closedThemes.length > 0
-                ? ` 済: ${wall.closedThemes.join(", ")}`
-                : ""}
+              テーマは1つ。視点は複数。全員が専門から発言。議論に固定順序はありません。
             </p>
           </div>
         ) : null}
-        {(wall.decisions && wall.decisions.length > 0) ||
-        (wall.rejectedItems && wall.rejectedItems.length > 0) ||
-        (wall.ceoQuestions && wall.ceoQuestions.length > 0) ||
-        (wall.priorityIssues && wall.priorityIssues.length > 0) ||
-        (wall.openTopics && wall.openTopics.length > 0) ? (
+        {(() => {
+          const unresolved =
+            wall.unresolvedIssues && wall.unresolvedIssues.length > 0
+              ? wall.unresolvedIssues
+              : (wall.openTopics ?? [])
+                  .filter((t) => t.status !== "resolved")
+                  .map((t) => t.label);
+          const resolved =
+            wall.resolvedIssues && wall.resolvedIssues.length > 0
+              ? wall.resolvedIssues
+              : (wall.openTopics ?? [])
+                  .filter((t) => t.status === "resolved")
+                  .map((t) => t.label);
+          const hasMemory =
+            unresolved.length > 0 ||
+            resolved.length > 0 ||
+            (wall.decisions && wall.decisions.length > 0) ||
+            (wall.rejectedItems && wall.rejectedItems.length > 0);
+          if (!hasMemory) return null;
+          return (
           <div className="mt-3 space-y-2 rounded border border-stone-200 bg-stone-50 px-3 py-2">
             <div className="text-[11px] font-semibold tracking-wide text-stone-500">
               会議メモリ（CEOが毎ターン更新）
             </div>
-            {wall.decisions && wall.decisions.length > 0 ? (
+            {unresolved.length > 0 ? (
+              <div>
+                <div className="text-[11px] font-medium text-amber-900">
+                  未解決Issue
+                </div>
+                <ul className="mt-1.5 flex flex-wrap gap-2">
+                  {unresolved.map((label, index) => (
+                    <li
+                      key={`u-${label}-${index}`}
+                      className="rounded border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-950"
+                    >
+                      {label}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {resolved.length > 0 ? (
               <div>
                 <div className="text-[11px] font-medium text-emerald-800">
+                  解決済みIssue
+                </div>
+                <ul className="mt-1.5 flex flex-wrap gap-2">
+                  {resolved.map((label, index) => (
+                    <li
+                      key={`r-${label}-${index}`}
+                      className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs text-emerald-950"
+                    >
+                      ✓ {label}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {wall.decisions && wall.decisions.length > 0 ? (
+              <div>
+                <div className="text-[11px] font-medium text-stone-700">
                   決定事項（前提）
                 </div>
                 <ul className="mt-1 flex flex-wrap gap-1.5">
                   {wall.decisions.map((item) => (
                     <li
                       key={item}
-                      className="rounded border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-xs text-emerald-950"
+                      className="rounded border border-stone-300 bg-white px-2 py-0.5 text-xs text-stone-800"
                     >
                       {item}
                     </li>
@@ -754,91 +1111,9 @@ export function DiscussionChat({
                 </ul>
               </div>
             ) : null}
-            {wall.ceoQuestions && wall.ceoQuestions.length > 0 ? (
-              <div>
-                <div className="text-[11px] font-medium text-indigo-900">
-                  CEO質問ボード
-                </div>
-                <ul className="mt-1.5 flex flex-wrap gap-2">
-                  {wall.ceoQuestions
-                    .filter((q) => q.status !== "PARKED")
-                    .map((q) => {
-                      const style =
-                        q.status === "RESOLVED"
-                          ? "border-emerald-300 bg-emerald-50 text-emerald-900 line-through decoration-emerald-400/70"
-                          : q.status === "ANSWERED"
-                            ? "border-sky-300 bg-sky-50 text-sky-950"
-                            : "border-indigo-300 bg-indigo-50 text-indigo-950";
-                      const label =
-                        q.status === "RESOLVED"
-                          ? "解決"
-                          : q.status === "ANSWERED"
-                            ? "回答済"
-                            : "未回答";
-                      return (
-                        <li
-                          key={q.id}
-                          className={`max-w-full rounded border px-2 py-1 text-xs ${style}`}
-                          title={q.note ?? undefined}
-                        >
-                          <span className="mr-1 opacity-70">[{label}]</span>
-                          {q.text}
-                        </li>
-                      );
-                    })}
-                </ul>
-              </div>
-            ) : null}
-            {(() => {
-              const unresolved = (wall.openTopics ?? []).filter(
-                (t) => t.status !== "resolved",
-              );
-              const priorities =
-                wall.priorityIssues && wall.priorityIssues.length > 0
-                  ? wall.priorityIssues
-                  : unresolved.map((t) => t.label).slice(0, 4);
-              const extraCount = Math.max(0, unresolved.length - priorities.length);
-              if (priorities.length === 0 && unresolved.length === 0) return null;
-              return (
-                <div>
-                  <div className="text-[11px] font-medium text-amber-900">
-                    重要論点（優先度順）
-                    {unresolved.length > 0 ? (
-                      <span className="ml-1 font-normal text-stone-500">
-                        — 未解決は全体で{unresolved.length}件
-                        {extraCount > 0 ? `（他${extraCount}件は裏で保持）` : ""}
-                      </span>
-                    ) : null}
-                  </div>
-                  <ul className="mt-1.5 flex flex-wrap gap-2">
-                    {priorities.map((label, index) => {
-                      const topic = unresolved.find(
-                        (t) => t.label === label || t.id === label,
-                      );
-                      const style =
-                        topic?.status === "discussing"
-                          ? "border-sky-300 bg-sky-50 text-sky-950"
-                          : "border-amber-300 bg-amber-50 text-amber-950";
-                      return (
-                        <li
-                          key={`${label}-${index}`}
-                          className={`rounded border px-2 py-1 text-xs ${style}`}
-                          title={topic?.note ?? undefined}
-                        >
-                          <span className="mr-1 opacity-60">{index + 1}.</span>
-                          {label}
-                          {topic?.status === "discussing" ? (
-                            <span className="ml-1 opacity-70">（議論中）</span>
-                          ) : null}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </div>
-              );
-            })()}
           </div>
-        ) : null}
+          );
+        })()}
         <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-stone-600">
           <span className="font-medium text-stone-800">
             企画 Version{currentVersion}
@@ -848,6 +1123,33 @@ export function DiscussionChat({
               履歴: {planVersions.map((v) => `V${v.version}`).join(" → ")}
             </span>
           ) : null}
+          <label className="ml-auto flex items-center gap-1 text-[11px] text-slate-600">
+            AIデバッガー
+            <select
+              className="rounded border border-slate-300 bg-white px-1.5 py-0.5 text-[11px]"
+              value={wall.debugger?.mode ?? "PASSIVE"}
+              disabled={busyInterrupt}
+              onChange={(e) =>
+                void runControl("set_debugger_mode", {
+                  debuggerMode: e.target.value as "OFF" | "PASSIVE" | "ACTIVE",
+                })
+              }
+            >
+              <option value="OFF">OFF</option>
+              <option value="PASSIVE">PASSIVE</option>
+              <option value="ACTIVE">ACTIVE</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            className="rounded border border-slate-300 px-1.5 py-0.5 text-[11px] text-slate-700 hover:bg-slate-50"
+            onClick={() => setDebugLogOpen((v) => !v)}
+          >
+            デバッグ履歴
+            {(wall.debugger?.openCount ?? 0) > 0
+              ? ` (${wall.debugger?.openCount})`
+              : ""}
+          </button>
         </div>
         {currentPlan?.summary ? (
           <details className="mt-2 text-sm">
@@ -883,6 +1185,22 @@ export function DiscussionChat({
             );
           }
 
+          if (
+            msg.kind === "diagnostic" ||
+            msg.messageType === "ai_debugger" ||
+            msg.messageType === "debug_summary"
+          ) {
+            if ((wall.debugger?.mode ?? "PASSIVE") === "OFF") return null;
+            return (
+              <DiagnosticCard
+                key={msg.id ?? `dbg-${index}`}
+                msg={msg}
+                busy={busyInterrupt}
+                onRepair={handleDebuggerRepair}
+              />
+            );
+          }
+
           const proposer = isProposerMsg(msg);
           const isSystem = msg.speakerType === "system";
           const roleKey =
@@ -914,11 +1232,15 @@ export function DiscussionChat({
                   {msg.moveType ? (
                     <span>{MOVE_LABELS[msg.moveType] ?? msg.moveType}</span>
                   ) : null}
-                  {msg.addressTo === "officer" && msg.addressRoleKey ? (
-                    <span>→ {msg.addressRoleKey}</span>
-                  ) : msg.addressTo === "proposer" ? (
-                    <span>→ 企画者</span>
-                  ) : null}
+                  {(() => {
+                    const arrow = addressArrowLabel({
+                      targetType: msg.targetType,
+                      targetParticipantId: msg.targetParticipantId,
+                      addressTo: msg.addressTo,
+                      addressRoleKey: msg.addressRoleKey,
+                    });
+                    return arrow ? <span>{arrow}</span> : null;
+                  })()}
                 </div>
                 <p className="mt-1 whitespace-pre-wrap text-sm leading-relaxed">
                   {text}
@@ -1161,6 +1483,71 @@ export function DiscussionChat({
         <p className="border-t border-rose-200 px-4 py-2 text-sm text-rose-700">
           {error}
         </p>
+      ) : null}
+      </div>
+
+      {showDebugHistory ? (
+        <aside className="flex max-h-[40rem] w-full shrink-0 flex-col border-t border-slate-300 bg-slate-50 lg:max-h-none lg:w-72 lg:border-l lg:border-t-0">
+          <div className="border-b border-slate-300 px-3 py-2">
+            <div className="text-[11px] font-semibold tracking-wide text-slate-600">
+              デバッグ履歴
+            </div>
+            <div className="mt-0.5 text-[10px] text-slate-500">
+              未対応 {wall.debugger?.openCount ?? 0}件 · {debuggerMode}
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto px-2 py-2 text-[11px] text-slate-800">
+            {(wall.debugger?.findings ?? []).length === 0 ? (
+              <p className="px-1 text-slate-500">まだ検知はありません。</p>
+            ) : (
+              (wall.debugger?.findings ?? [])
+                .slice()
+                .reverse()
+                .map((f) => {
+                  const topCause =
+                    f.estimatedCauses?.[0]?.label ?? f.causes?.[0] ?? f.ruleId;
+                  const done =
+                    f.status.includes("repair") || f.status === "ignored";
+                  return (
+                    <div
+                      key={f.id}
+                      className="mb-2 rounded border border-slate-200 bg-white px-2 py-1.5"
+                    >
+                      <div className="text-[10px] text-slate-500">
+                        {f.createdAt?.slice(11, 19) ?? "--:--:--"} ·{" "}
+                        {f.severity}
+                      </div>
+                      <div className="mt-0.5 font-medium text-slate-900">
+                        {f.title}
+                      </div>
+                      <div className="mt-0.5 text-slate-700">原因: {topCause}</div>
+                      <div className="mt-0.5">
+                        {done ? (
+                          <span className="text-emerald-700">
+                            {f.status === "ignored" ? "無視" : "改善済み"}
+                          </span>
+                        ) : (
+                          <span className="text-amber-800">未対応</span>
+                        )}
+                      </div>
+                      {(f.fixTargets ?? []).length > 0 ? (
+                        <div className="mt-1 flex flex-wrap gap-0.5">
+                          {f.fixTargets!.slice(0, 4).map((t) => (
+                            <span
+                              key={t}
+                              className="rounded bg-slate-100 px-1 text-[9px] text-slate-700"
+                            >
+                              {t}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })
+            )}
+          </div>
+        </aside>
       ) : null}
     </div>
   );

@@ -1,6 +1,5 @@
 import { prisma } from "@/lib/db";
 import { runDiscussionUtterance } from "@/lib/ai/run-board-member";
-import { isSimilarPoint, similarityScore } from "@/lib/ai/dedupe";
 import {
   runDiscussionBriefSummary,
   runDiscussionFacilitator,
@@ -20,15 +19,44 @@ import {
 } from "@/lib/meeting/constants";
 import { pickThinkingLine, thinkingTitle } from "@/lib/meeting/thinking-messages";
 import {
-  detectThemeFromText,
-  firstOpenTheme,
-  isDiscussionThemeId,
-  nextThemeId,
-  pickFocusSpeaker,
-  themeDef,
-  themesAllClosed,
-  type DiscussionThemeId,
+  analyzeDiscussionTurn,
+  applySafeRepair,
+  computeQualityScores,
+  createDebuggerState,
+  formatQualitySummary,
+  hydrateFinding,
+  mergeFindings,
+  parseDebuggerState,
+  severityEmoji,
+  type DebuggerFinding,
+  type DebuggerMode,
+  type DebuggerState,
+} from "@/lib/meeting/ai-debugger";
+import {
+  broadenPerspectiveUtterance,
+  dedupeIssueLabels,
+  detectThemeMonopoly,
+  migrateThemeLabel,
+  normalizeThemeLabel,
+  perspectiveHint,
+  pickPerspectiveOfficer,
+  pickNextThemeFromIssues,
+  themeCloseUtterance,
 } from "@/lib/meeting/discussion-themes";
+import {
+  guardRepeatedCeoQuestion as guardRepeatedCeoQuestionCore,
+  isRepeatedCeoChairUtterance,
+  markOpenQuestionsAnswered as markOpenQuestionsAnsweredBoard,
+  markOpenQuestionsAnsweredByOfficerProgress as markOpenQuestionsAnsweredByOfficerProgressBoard,
+  registerOpenCeoQuestion as registerOpenCeoQuestionBoard,
+} from "@/lib/meeting/ceo-questions";
+import {
+  detectCeoExplicitNomination,
+  formatNominationOverrideNotice,
+  normalizeUtteranceAddress,
+  resolveNextSpeaker,
+  roleDisplayLabel,
+} from "@/lib/meeting/speaker-routing";
 import type { Prisma } from "@/generated/prisma/client";
 import { randomUUID } from "crypto";
 import type {
@@ -83,14 +111,20 @@ export type DiscussionMessage = {
   metadata?: Record<string, unknown>;
   addressTo?: string;
   addressRoleKey?: string | null;
+  /** Structured destination (preferred over addressTo). */
+  targetType?: "proposer" | "executive" | "chair" | "all" | "none";
+  /** roleKey when targetType === "executive" */
+  targetParticipantId?: string | null;
   moveType?: string;
   nominateReason?: string;
-  kind?: "chat" | "plan_update" | "brief_summary" | "thinking";
+  kind?: "chat" | "plan_update" | "brief_summary" | "thinking" | "diagnostic";
   planUpdate?: {
     version: number;
     changes: string[];
     summary: string;
   };
+  /** AI Debugger finding payload when kind === "diagnostic" */
+  diagnostic?: DebuggerFinding;
 };
 
 type PendingSpeak = {
@@ -119,16 +153,20 @@ type WallChatState = {
   openTopics: DiscussionTopic[];
   /** Top-priority issue labels for UI (importance order, max 4). */
   priorityIssues: string[];
-  /** Single active discussion theme (profit → customer → operations → brand). */
-  activeTheme: DiscussionThemeId;
-  /** Themes already closed by CEO. */
-  closedThemes: DiscussionThemeId[];
+  /** Free-form current theme label (CEO-managed). No fixed order. */
+  activeTheme: string;
+  /** Unresolved issue labels. */
+  unresolvedIssues: string[];
+  /** Resolved issue labels. */
+  resolvedIssues: string[];
   /** CEO-managed questions with OPEN/ANSWERED/RESOLVED/PARKED. */
   ceoQuestions: CeoQuestion[];
   /** Confirmed premises for the rest of the meeting. */
   decisions: string[];
   /** Explicitly rejected ideas — must not be re-proposed. */
   rejectedItems: string[];
+  /** AI Debugger (audit) — not a meeting participant. */
+  debugger: DebuggerState;
 };
 
 function asStringArray(value: unknown): string[] {
@@ -301,12 +339,26 @@ function readWallChatState(
     .map((s) => s.slice(0, 80))
     .slice(0, 4);
 
-  const closedThemes = asStringArray(data.closedThemes).filter(
-    isDiscussionThemeId,
-  ) as DiscussionThemeId[];
-  const activeTheme: DiscussionThemeId = isDiscussionThemeId(data.activeTheme)
-    ? data.activeTheme
-    : (firstOpenTheme(closedThemes) ?? "profit");
+  const activeTheme = migrateThemeLabel(data.activeTheme);
+
+  let unresolvedIssues = dedupeIssueLabels(
+    asStringArray(data.unresolvedIssues),
+  );
+  let resolvedIssues = dedupeIssueLabels(asStringArray(data.resolvedIssues));
+
+  // Migrate from openTopics / legacy closedThemes when issue lists are empty
+  if (unresolvedIssues.length === 0 && resolvedIssues.length === 0) {
+    unresolvedIssues = dedupeIssueLabels(
+      openTopics
+        .filter((t) => t.status !== "resolved")
+        .map((t) => t.label)
+        .concat(priorityIssues),
+    );
+    resolvedIssues = dedupeIssueLabels([
+      ...openTopics.filter((t) => t.status === "resolved").map((t) => t.label),
+      ...asStringArray(data.closedThemes).map((id) => migrateThemeLabel(id)),
+    ]);
+  }
 
   let ceoQuestions: CeoQuestion[] = [];
   if (Array.isArray(data.ceoQuestions)) {
@@ -355,10 +407,12 @@ function readWallChatState(
     openTopics,
     priorityIssues,
     activeTheme,
-    closedThemes,
+    unresolvedIssues,
+    resolvedIssues,
     ceoQuestions,
     decisions,
     rejectedItems,
+    debugger: parseDebuggerState(data.debugger),
   };
 }
 
@@ -494,11 +548,13 @@ async function ensureRound(
           forcedNominateReason: null,
           openTopics: [],
           priorityIssues: [],
-          activeTheme: "profit",
-          closedThemes: [],
+          activeTheme: "利益性",
+          unresolvedIssues: [],
+          resolvedIssues: [],
           ceoQuestions: [],
           decisions: [],
           rejectedItems: [],
+          debugger: createDebuggerState("PASSIVE"),
         } as Json,
       },
     });
@@ -538,10 +594,12 @@ async function persistDiscussion(
     openTopics: state.openTopics,
     priorityIssues: state.priorityIssues,
     activeTheme: state.activeTheme,
-    closedThemes: state.closedThemes,
+    unresolvedIssues: state.unresolvedIssues,
+    resolvedIssues: state.resolvedIssues,
     ceoQuestions: state.ceoQuestions,
     decisions: state.decisions,
     rejectedItems: state.rejectedItems,
+    debugger: state.debugger,
   };
 
   await prisma.meetingRound.update({
@@ -615,11 +673,20 @@ function publicState(state: WallChatState) {
     openTopics: state.openTopics,
     priorityIssues: state.priorityIssues,
     activeTheme: state.activeTheme,
-    closedThemes: state.closedThemes,
-    activeThemeLabel: themeDef(state.activeTheme).label,
+    activeThemeLabel: state.activeTheme,
+    unresolvedIssues: state.unresolvedIssues,
+    resolvedIssues: state.resolvedIssues,
     ceoQuestions: state.ceoQuestions,
     decisions: state.decisions,
     rejectedItems: state.rejectedItems,
+    debugger: {
+      mode: state.debugger.mode,
+      findings: state.debugger.findings,
+      repairLog: state.debugger.repairLog,
+      scores: state.debugger.scores,
+      openCount: state.debugger.findings.filter((f) => f.status === "open")
+        .length,
+    },
   };
 }
 
@@ -631,32 +698,189 @@ function unresolvedTopics(topics: DiscussionTopic[]): DiscussionTopic[] {
   return topics.filter((t) => t.status !== "resolved");
 }
 
+function buildAnalyzeContext(
+  state: WallChatState,
+  reviewLevel: ReviewLevel,
+  extra: Partial<{
+    lastFacilitatorAction: string | null;
+    lastRoutedRole: string | null;
+    lastAskerRole: string | null;
+    facilitatorJsonFailed: boolean;
+    staleResponseDiscarded: boolean;
+    apiTimeout: boolean;
+    duplicateResponseDetected: boolean;
+  }> = {},
+) {
+  return {
+    messages: state.messages,
+    activeTheme: state.activeTheme,
+    unresolvedIssues: state.unresolvedIssues,
+    resolvedIssues: state.resolvedIssues,
+    openTopics: state.openTopics,
+    ceoQuestions: state.ceoQuestions,
+    decisions: state.decisions,
+    rejectedItems: state.rejectedItems,
+    currentVersion: state.currentVersion,
+    reviewLevel,
+    lastFacilitatorAction: extra.lastFacilitatorAction ?? null,
+    lastRoutedRole: extra.lastRoutedRole ?? null,
+    lastAskerRole: extra.lastAskerRole ?? null,
+    facilitatorJsonFailed: extra.facilitatorJsonFailed ?? false,
+    staleResponseDiscarded: extra.staleResponseDiscarded ?? false,
+    apiTimeout: extra.apiTimeout ?? false,
+    duplicateResponseDetected: extra.duplicateResponseDetected ?? false,
+  };
+}
+
+/** Run debugger analysis; push at most one diagnostic card. Optionally auto-repair in ACTIVE. */
+function runDebuggerPass(
+  state: WallChatState,
+  reviewLevel: ReviewLevel,
+  extra: Parameters<typeof buildAnalyzeContext>[2] = {},
+  availableRoleKeys: string[] = [],
+): void {
+  if (state.debugger.mode === "OFF") return;
+
+  const ctx = buildAnalyzeContext(state, reviewLevel, extra);
+  const incoming = analyzeDiscussionTurn(ctx, state.debugger);
+  const added = mergeFindings(state.debugger, incoming);
+  // Ensure cards carry full improvement-assistant payload
+  for (const f of added) {
+    Object.assign(f, hydrateFinding(f));
+  }
+  state.debugger.scores = computeQualityScores(ctx, state.debugger);
+  state.debugger.lastAnalyzedMessageCount = state.messages.length;
+
+  // Only surface the highest-severity new finding as a timeline card
+  const toShow = added[0];
+  if (!toShow) return;
+
+  let statusNote = "";
+  if (state.debugger.mode === "ACTIVE" && toShow.autoRepairable && toShow.repairKind) {
+    const result = applySafeRepair({
+      finding: toShow,
+      action: "auto",
+      state,
+      availableRoleKeys,
+      recentRoleKeys: recentBoardRoleKeys(state.messages),
+    });
+    toShow.status = "auto_repaired";
+    toShow.repairedAt = new Date().toISOString();
+    state.debugger.repairLog = [
+      ...state.debugger.repairLog,
+      {
+        at: toShow.repairedAt,
+        findingId: toShow.id,
+        action: "auto" as const,
+        note: result.note,
+        repairKind: toShow.repairKind,
+      },
+    ].slice(-40);
+    statusNote = result.note;
+    if (result.chairUtterance) {
+      pushMessage(state, {
+        speakerType: "chair",
+        roleKey: "ceo",
+        title: "CEO",
+        text: result.chairUtterance.slice(0, 150),
+        kind: "chat",
+        messageType: "debugger_repair",
+        metadata: { findingId: toShow.id },
+      });
+    }
+    state.debugger.scores = computeQualityScores(
+      buildAnalyzeContext(state, reviewLevel, extra),
+      state.debugger,
+    );
+  }
+
+  pushMessage(state, {
+    speakerType: "system",
+    roleKey: null,
+    title: "AIデバッガー",
+    text: `${severityEmoji(toShow.severity)} ${toShow.title}\n\n${toShow.detection}${statusNote ? `\n\n修復: ${statusNote}` : ""}`.slice(
+      0,
+      400,
+    ),
+    kind: "diagnostic",
+    messageType: "ai_debugger",
+    diagnostic: toShow,
+    metadata: {
+      findingId: toShow.id,
+      ruleId: toShow.ruleId,
+      severity: toShow.severity,
+    },
+  });
+}
+
+function pushDebuggerSummary(state: WallChatState, reviewLevel: ReviewLevel): void {
+  if (state.debugger.mode === "OFF") return;
+  state.debugger.scores = computeQualityScores(
+    buildAnalyzeContext(state, reviewLevel),
+    state.debugger,
+  );
+  const text = formatQualitySummary(state.debugger.scores);
+  pushMessage(state, {
+    speakerType: "system",
+    roleKey: null,
+    title: "AIデバッガー",
+    text,
+    kind: "diagnostic",
+    messageType: "debug_summary",
+    metadata: { scores: state.debugger.scores },
+  });
+}
+
 function applyMeetingMemory(
   state: WallChatState,
   next: {
     openTopics?: DiscussionTopic[];
     priorityIssues?: string[];
+    unresolvedIssues?: string[];
+    resolvedIssues?: string[];
     ceoQuestions?: CeoQuestion[];
     decisions?: string[];
     rejectedItems?: string[];
-    activeTheme?: DiscussionThemeId;
-    closedThemes?: DiscussionThemeId[];
+    activeTheme?: string | null;
   },
 ): void {
-  if (next.activeTheme && isDiscussionThemeId(next.activeTheme)) {
-    state.activeTheme = next.activeTheme;
-  }
-  if (Array.isArray(next.closedThemes)) {
-    state.closedThemes = next.closedThemes.filter(isDiscussionThemeId);
+  if (typeof next.activeTheme === "string" && next.activeTheme.trim()) {
+    state.activeTheme = normalizeThemeLabel(next.activeTheme);
   }
   if (next.openTopics && next.openTopics.length > 0) {
     state.openTopics = next.openTopics.slice(0, 12);
   }
-  if (Array.isArray(next.priorityIssues)) {
+  const hasIssueUpdate =
+    (Array.isArray(next.unresolvedIssues) &&
+      next.unresolvedIssues.length > 0) ||
+    (Array.isArray(next.resolvedIssues) && next.resolvedIssues.length > 0);
+  if (hasIssueUpdate) {
+    if (Array.isArray(next.unresolvedIssues)) {
+      state.unresolvedIssues = dedupeIssueLabels(next.unresolvedIssues);
+    }
+    if (Array.isArray(next.resolvedIssues)) {
+      state.resolvedIssues = dedupeIssueLabels(next.resolvedIssues);
+    }
+  } else if (next.openTopics && next.openTopics.length > 0) {
+    state.unresolvedIssues = dedupeIssueLabels(
+      next.openTopics
+        .filter((t) => t.status !== "resolved")
+        .map((t) => t.label),
+    );
+    state.resolvedIssues = dedupeIssueLabels(
+      next.openTopics
+        .filter((t) => t.status === "resolved")
+        .map((t) => t.label),
+    );
+  }
+  // Keep priorityIssues aligned with unresolved (UI subset)
+  if (Array.isArray(next.priorityIssues) && next.priorityIssues.length > 0) {
     state.priorityIssues = next.priorityIssues
       .map((s) => s.trim().slice(0, 80))
       .filter(Boolean)
       .slice(0, 4);
+  } else {
+    state.priorityIssues = state.unresolvedIssues.slice(0, 4);
   }
   if (Array.isArray(next.ceoQuestions) && next.ceoQuestions.length > 0) {
     state.ceoQuestions = next.ceoQuestions
@@ -717,49 +941,30 @@ function focusTopicFromState(state: WallChatState): DiscussionTopic | undefined 
 }
 
 
-function isSameCeoQuestion(a: string, b: string): boolean {
-  if (!a.trim() || !b.trim()) return false;
-  return isSimilarPoint(a, b) || similarityScore(a, b) >= 0.55;
-}
-
-function findSimilarCeoQuestion(
-  questions: CeoQuestion[],
-  text: string,
-  statuses?: CeoQuestion["status"][],
-): CeoQuestion | undefined {
-  return questions.find(
-    (q) =>
-      (!statuses || statuses.includes(q.status)) &&
-      isSameCeoQuestion(q.text, text),
-  );
-}
-
 function registerOpenCeoQuestion(state: WallChatState, text: string): void {
-  const trimmed = text.trim().slice(0, 120);
-  if (!trimmed) return;
-  if (findSimilarCeoQuestion(state.ceoQuestions, trimmed)) return;
-  const next: CeoQuestion = {
-    id: `q_${randomUUID().slice(0, 8)}`,
-    text: trimmed,
-    status: "OPEN",
-    note: null,
-  };
-  state.ceoQuestions = [...state.ceoQuestions, next].slice(-12);
+  state.ceoQuestions = registerOpenCeoQuestionBoard(state.ceoQuestions, text);
 }
 
-/** After a proposer reply, mark OPEN questions as ANSWERED for CEO judgment. */
 function markOpenQuestionsAnswered(
   state: WallChatState,
   answerText: string,
 ): void {
-  const note = answerText.trim().slice(0, 120) || null;
-  state.ceoQuestions = state.ceoQuestions.map((q) =>
-    q.status === "OPEN"
-      ? { ...q, status: "ANSWERED" as const, note: note ?? q.note ?? null }
-      : q,
+  state.ceoQuestions = markOpenQuestionsAnsweredBoard(
+    state.ceoQuestions,
+    answerText,
   );
 }
 
+function markOpenQuestionsAnsweredByOfficerProgress(
+  state: WallChatState,
+  officerText: string,
+): void {
+  state.ceoQuestions = markOpenQuestionsAnsweredByOfficerProgressBoard(
+    state.ceoQuestions,
+    state.messages,
+    officerText,
+  );
+}
 
 function lastBoardSpeakerRoleKey(
   messages: DiscussionMessage[],
@@ -796,20 +1001,27 @@ type ContentRoute = {
   reason: string;
 };
 
-/** Map question/topic content → who can deepen debate among officers. */
+/** Map question/topic content → debate kind. Role is NEVER locked to a theme. */
 function inferContentRoute(
   text: string,
   availableRoleKeys: string[],
   avoidRoleKey?: string | null,
+  recentRoleKeys: string[] = [],
+  themeLabel?: string | null,
 ): ContentRoute {
   const raw = text.trim();
   const lower = raw.toLowerCase();
   const has = (re: RegExp) => re.test(raw) || re.test(lower);
 
-  const pick = (role: string, kind: string, reason: string): ContentRoute => ({
+  const multi = (kind: string, reason: string): ContentRoute => ({
     action: "nominate",
-    roleKey:
-      availableRoleKeys.includes(role) && role !== avoidRoleKey ? role : null,
+    // null → caller uses pickPerspectiveOfficer (multi-view)
+    roleKey: pickPerspectiveOfficer({
+      availableRoleKeys,
+      recentRoleKeys,
+      avoidRoleKey,
+      themeLabel,
+    }),
     kind,
     reason,
   });
@@ -828,75 +1040,79 @@ function inferContentRoute(
     };
   }
 
-  if (has(/ROI|roi|投資回収|回収期間|損益分岐|投資対効果/)) {
-    return pick("cfo", "roi_calc", "ROI・回収の議論はCFO");
+  // Profit / ROI / cost: multi-perspective — NOT CFO-only
+  if (
+    has(
+      /ROI|roi|投資回収|回収期間|損益分岐|投資対効果|利益率|粗利|売上|価格|値段|コスト|費用|無料|有料|収益|損失/,
+    )
+  ) {
+    return multi(
+      "revenue_cost_premise",
+      "利益・コストは多視点（獲得・支払意思・開発費・運用）で前進",
+    );
   }
   if (has(/技術実現|実現性|システム化|アプリ化|開発工数|過剰設計|API|インフラ|セキュリティ/)) {
-    return pick("cto", "tech_feasibility", "技術実現性はCTO");
+    return multi("tech_feasibility", "技術論点もテーマ解決の一視点として多視点で");
   }
   if (has(/運用|現場|スタッフ教育|マニュアル|オペレーション|シフト|負荷/)) {
-    return pick("operations", "operations", "運用は現場責任者");
+    return multi("operations", "運用視点をテーマ解決へ交差させる");
   }
-  if (has(/顧客心理|使いた|分かりやす|不快|強制感|劣等感|本音/)) {
-    return pick("customer", "customer_psychology", "顧客心理は顧客代表");
+  if (has(/顧客心理|使いた|分かりやす|不快|強制感|劣等感|本音|支払/)) {
+    return multi("customer_psychology", "顧客視点をテーマ解決へ交差させる");
   }
   if (has(/ブランド|訴求|獲得チャネル|口コミ|マーケ|認知/)) {
-    return pick("marketing", "brand", "ブランド・訴求はマーケティング");
-  }
-  // Price/margin debate: officers first (marketing/cfo), not auto ask_proposer
-  if (has(/利益率|粗利|売上|価格|値段|コスト|費用|無料|有料/)) {
-    const role =
-      avoidRoleKey === "cfo"
-        ? "marketing"
-        : availableRoleKeys.includes("marketing")
-          ? "marketing"
-          : "cfo";
-    return pick(role, "revenue_cost_premise", "価格・利益は役員同士で仮定を戦わせる");
+    return multi("brand", "マーケ視点をテーマ解決へ交差させる");
   }
 
-  // Default: keep officer debate going
-  return {
-    action: "nominate",
-    roleKey: null,
-    kind: "other",
-    reason: "役員同士で論点を深める",
-  };
+  return multi("other", "役員同士で論点を多視点に深める");
 }
 
 function routeFromRoutingKind(
   kind: string | null | undefined,
   availableRoleKeys: string[],
   avoidRoleKey?: string | null,
+  recentRoleKeys: string[] = [],
+  themeLabel?: string | null,
 ): ContentRoute | null {
-  const pick = (role: string, reason: string): ContentRoute => ({
-    action: "nominate",
-    roleKey:
-      availableRoleKeys.includes(role) && role !== avoidRoleKey ? role : null,
-    kind: kind ?? "other",
-    reason,
+  if (!kind) return null;
+
+  // Never lock a routingKind to a single role — pick a fresh perspective
+  const roleKey = pickPerspectiveOfficer({
+    availableRoleKeys,
+    recentRoleKeys,
+    avoidRoleKey,
+    themeLabel,
   });
 
-  switch (kind) {
-    case "plan_content":
-    case "revenue_cost_premise":
-      // Debate among officers first; ask_proposer only when facilitator explicitly chooses it
-      return pick(
-        avoidRoleKey === "cfo" ? "marketing" : "cfo",
-        "前提論点は役員同士で先に深掘り",
-      );
-    case "roi_calc":
-      return pick("cfo", "ROI計算はCFO");
-    case "tech_feasibility":
-      return pick("cto", "技術実現性はCTO");
-    case "operations":
-      return pick("operations", "運用は現場責任者");
-    case "customer_psychology":
-      return pick("customer", "顧客心理は顧客代表");
-    case "brand":
-      return pick("marketing", "ブランドはマーケティング責任者");
-    default:
-      return null;
+  const reasons: Record<string, string> = {
+    plan_content: "企画内容は多視点で先に深掘り",
+    revenue_cost_premise: "収益・コスト前提は多視点で交差させる",
+    roi_calc: "ROI論点もCFO専有にせず多視点で構造確認",
+    tech_feasibility: "技術視点をテーマ解決へ",
+    operations: "運用視点をテーマ解決へ",
+    customer_psychology: "顧客視点をテーマ解決へ",
+    brand: "マーケ視点をテーマ解決へ",
+    other: "多視点で前進",
+  };
+
+  if (
+    kind === "plan_content" ||
+    kind === "revenue_cost_premise" ||
+    kind === "roi_calc" ||
+    kind === "tech_feasibility" ||
+    kind === "operations" ||
+    kind === "customer_psychology" ||
+    kind === "brand" ||
+    kind === "other"
+  ) {
+    return {
+      action: "nominate",
+      roleKey,
+      kind,
+      reason: reasons[kind] ?? "多視点で前進",
+    };
   }
+  return null;
 }
 
 function detectOfficerRedirectFromProposer(
@@ -944,6 +1160,8 @@ function applyContentRoutingGuard(args: {
   nominateReason: string;
   chairUtterance: string | null;
   routingKind?: string | null;
+  /** When true, do not let auto content router overwrite the locked pick */
+  nominationLocked?: boolean;
 }): {
   action: DiscussionFacilitatorOutput["action"];
   nextSpeakerRoleKey: string | null;
@@ -973,15 +1191,23 @@ function applyContentRoutingGuard(args: {
       args.availableRoleKeys,
     );
 
+  const recent = recentBoardRoleKeys(args.state.messages);
+  const themeLabel = args.state.activeTheme;
+  const monopoly = detectThemeMonopoly({ recentRoleKeys: recent });
+
   const routeFromKind = routeFromRoutingKind(
     args.routingKind,
     args.availableRoleKeys,
     askerRole,
+    recent,
+    themeLabel,
   );
   const routeFromText = inferContentRoute(
     last?.text ?? args.state.priorityIssues[0] ?? "",
     args.availableRoleKeys,
     askerRole,
+    recent,
+    themeLabel,
   );
   const preferred = routeFromKind ?? routeFromText;
 
@@ -989,13 +1215,14 @@ function applyContentRoutingGuard(args: {
   let nextSpeakerRoleKey = args.nextSpeakerRoleKey;
   let nominateReason = args.nominateReason;
   let chairUtterance = args.chairUtterance;
+  const locked = Boolean(args.nominationLocked && nextSpeakerRoleKey);
 
-  // Proposer handed discussion to an officer → continue officer debate
+  // Priority 1: Proposer handed discussion to an officer
   if (redirected) {
     return {
       action: "nominate",
       nextSpeakerRoleKey: redirected,
-      nominateReason: `企画者が${redirected}へ議論を振ったので役員同士で継続`,
+      nominateReason: `企画者が${roleDisplayLabel(redirected)}へ議論を振ったので役員同士で継続`,
       chairUtterance: null,
     };
   }
@@ -1006,10 +1233,12 @@ function applyContentRoutingGuard(args: {
     recentAskProposerHeavy(args.state.messages)
   ) {
     action = "nominate";
-    nextSpeakerRoleKey =
-      preferred.roleKey && preferred.roleKey !== askerRole
-        ? preferred.roleKey
-        : null;
+    if (!locked) {
+      nextSpeakerRoleKey =
+        preferred.roleKey && preferred.roleKey !== askerRole
+          ? preferred.roleKey
+          : null;
+    }
     nominateReason = "企画者への質問が続いたため、先に役員同士で深掘り";
     chairUtterance = null;
   }
@@ -1021,11 +1250,12 @@ function applyContentRoutingGuard(args: {
     args.routingKind !== "plan_content" &&
     !/未提示|しか知らない|修正案|合意後/.test(args.nominateReason)
   ) {
-    // Still allow ask_proposer for explicit unique-fact routes
     if (preferred.kind !== "revenue_cost_premise" || preferred.action === "nominate") {
       action = "nominate";
-      nextSpeakerRoleKey = preferred.roleKey;
-      nominateReason = preferred.reason || "役員同士で先に議論";
+      if (!locked) {
+        nextSpeakerRoleKey = preferred.roleKey;
+        nominateReason = preferred.reason || "役員同士で先に議論";
+      }
       if (chairUtterance && /企画者/.test(chairUtterance)) {
         chairUtterance = null;
       }
@@ -1041,12 +1271,34 @@ function applyContentRoutingGuard(args: {
     preferred.action === "nominate"
   ) {
     action = "nominate";
-    nextSpeakerRoleKey =
-      preferred.roleKey ??
-      nextSpeakerRoleKey ??
-      null;
-    nominateReason = preferred.reason || "役員同士の議論を優先";
+    if (!locked) {
+      nextSpeakerRoleKey =
+        preferred.roleKey ??
+        nextSpeakerRoleKey ??
+        null;
+      nominateReason = preferred.reason || "役員同士の議論を優先";
+    }
     chairUtterance = null;
+  }
+
+  // Explicit nomination lock: skip auto overwrite / monopoly rotate
+  if (locked && action === "nominate") {
+    if (askerRole && nextSpeakerRoleKey === askerRole) {
+      // Anti-bounce with visible reason
+      nextSpeakerRoleKey =
+        preferred.roleKey && preferred.roleKey !== askerRole
+          ? preferred.roleKey
+          : null;
+      nominateReason = `${roleDisplayLabel(askerRole)}は直前発言者のため別視点で先に補足`;
+      chairUtterance =
+        chairUtterance?.trim() ||
+        formatNominationOverrideNotice(
+          askerRole,
+          nextSpeakerRoleKey ?? "operations",
+          nominateReason,
+        );
+    }
+    return { action, nextSpeakerRoleKey, nominateReason, chairUtterance };
   }
 
   const bouncing =
@@ -1064,15 +1316,14 @@ function applyContentRoutingGuard(args: {
       nominateReason = preferred.reason;
       chairUtterance = null;
     } else {
-      // pick any other officer — do NOT bounce to proposer by default
       action = "nominate";
-      nextSpeakerRoleKey = null; // caller will pickFallbackSpeaker avoiding asker
+      nextSpeakerRoleKey = null;
       nominateReason = "質問者への回し返し禁止。別の役員で議論を継続";
       chairUtterance = null;
     }
   }
 
-  // Fill missing nominate target from content route
+  // Fill missing nominate target from content route (only when unlocked / empty)
   if (
     action === "nominate" &&
     preferred.action === "nominate" &&
@@ -1099,15 +1350,48 @@ function applyContentRoutingGuard(args: {
     chairUtterance = null;
   }
 
+  // Theme monopoly: break role lock only when nomination is NOT explicit
+  if (action === "nominate") {
+    const ban =
+      monopoly.monopolized && monopoly.roleKey ? monopoly.roleKey : null;
+    const recentHeavy =
+      nextSpeakerRoleKey &&
+      recent.slice(-3).filter((r) => r === nextSpeakerRoleKey).length >= 2;
+    if (ban || recentHeavy) {
+      const fresh = pickPerspectiveOfficer({
+        availableRoleKeys: args.availableRoleKeys,
+        recentRoleKeys: recent,
+        avoidRoleKey: askerRole,
+        themeLabel,
+        banRoleKey: ban ?? nextSpeakerRoleKey,
+      });
+      if (fresh && fresh !== nextSpeakerRoleKey) {
+        const intended = nextSpeakerRoleKey;
+        nextSpeakerRoleKey = fresh;
+        nominateReason = `テーマ「${themeLabel}」の多視点展開（${perspectiveHint(fresh)}）`;
+        if (!chairUtterance || /CFO|お願いします/.test(chairUtterance)) {
+          chairUtterance = intended
+            ? formatNominationOverrideNotice(
+                intended,
+                fresh,
+                "同一役員の連続を避け多視点で前進",
+              )
+            : broadenPerspectiveUtterance(themeLabel, fresh);
+        }
+      }
+    }
+  }
+
   return { action, nextSpeakerRoleKey, nominateReason, chairUtterance };
 }
 
 
 /**
- * Enforce single-theme facilitation:
- * - park off-theme remarks
- * - close & advance on themeAction
- * - keep nominate within theme focus roles
+ * Theme facilitation without fixed order:
+ * - CEO manages current theme + issues
+ * - Perspectives that help the theme are allowed (no auto park-aside)
+ * - close_theme → declare organized, pick next unresolved issue as theme
+ * - Rotate among all officers on the current theme
  */
 function applyThemeFacilitation(args: {
   state: WallChatState;
@@ -1126,17 +1410,19 @@ function applyThemeFacilitation(args: {
   chairUtterance: string | null;
   closedNow: boolean;
 } {
-  let active = isDiscussionThemeId(args.activeTheme)
-    ? args.activeTheme
-    : args.state.activeTheme;
-  // Do not jump ahead of sequence
-  const expected = firstOpenTheme(args.state.closedThemes) ?? "profit";
-  if (
-    DISCUSSION_THEME_ORDER_INDEX(active) >
-    DISCUSSION_THEME_ORDER_INDEX(expected)
-  ) {
-    active = expected;
+  const previousTheme = args.state.activeTheme;
+  if (typeof args.activeTheme === "string" && args.activeTheme.trim()) {
+    // Officers must not change theme; only close_theme path may
+    const themeAction = args.themeAction ?? "continue";
+    if (themeAction === "close_theme" || args.action === "propose_end") {
+      // allow below
+    } else {
+      // Keep existing theme; ignore model jumping themes mid-discussion
+      args.state.activeTheme = previousTheme;
+    }
   }
+
+  let active = normalizeThemeLabel(args.state.activeTheme);
   args.state.activeTheme = active;
 
   let action = args.action;
@@ -1146,59 +1432,53 @@ function applyThemeFacilitation(args: {
   let closedNow = false;
 
   const themeAction = args.themeAction ?? "continue";
-  const detected = args.lastUtteranceText
-    ? detectThemeFromText(args.lastUtteranceText)
-    : null;
 
-  // Off-theme diversion → park
-  if (
-    detected &&
-    detected !== active &&
-    !args.state.closedThemes.includes(detected) &&
-    themeAction !== "close_and_advance"
-  ) {
-    action = "chair_nudge";
-    nextSpeakerRoleKey = pickFocusSpeaker(
-      active,
-      args.availableRoleKeys,
-      lastBoardSpeakerRoleKey(args.state.messages),
-    );
-    nominateReason = `別論点（${themeDef(detected).label}）は保留。現在は${themeDef(active).label}`;
-    chairUtterance = `その論点（${themeDef(detected).label}）は後ほど扱います。今は「${themeDef(active).label}」に集中しましょう。`;
-    return {
-      action,
-      nextSpeakerRoleKey,
-      nominateReason,
-      chairUtterance,
-      closedNow: false,
-    };
-  }
-
-  if (themeAction === "close_and_advance" || args.action === "propose_end") {
-    if (!args.state.closedThemes.includes(active)) {
-      args.state.closedThemes = [...args.state.closedThemes, active];
-    }
+  if (themeAction === "close_theme" || args.action === "propose_end") {
     closedNow = true;
-    const nxt = nextThemeId(active, args.state.closedThemes);
+    // Move current theme label into resolved if not already an issue label
+    if (!args.state.resolvedIssues.includes(previousTheme)) {
+      args.state.resolvedIssues = dedupeIssueLabels([
+        ...args.state.resolvedIssues,
+        previousTheme,
+      ]);
+    }
+    args.state.unresolvedIssues = args.state.unresolvedIssues.filter(
+      (label) => label !== previousTheme,
+    );
+
+    const modelNext =
+      typeof args.activeTheme === "string" &&
+      args.activeTheme.trim() &&
+      normalizeThemeLabel(args.activeTheme) !== previousTheme
+        ? normalizeThemeLabel(args.activeTheme)
+        : null;
+    const nxt =
+      modelNext ??
+      pickNextThemeFromIssues(args.state.unresolvedIssues, previousTheme);
     if (nxt) {
       args.state.activeTheme = nxt;
+      active = nxt;
+      // Drop the new theme from unresolved (it is now the focus)
+      args.state.unresolvedIssues = args.state.unresolvedIssues.filter(
+        (label) => label !== nxt,
+      );
       action = "nominate";
-      nextSpeakerRoleKey = pickFocusSpeaker(nxt, args.availableRoleKeys);
-      nominateReason = `次の論点「${themeDef(nxt).label}」を開始`;
-      chairUtterance = `この論点（${themeDef(active).label}）は整理できました。次は「${themeDef(nxt).label}」です。`;
-      // propose_end only when all themes closed
-      if (args.action === "propose_end" && !themesAllClosed(args.state.closedThemes)) {
-        // keep advancing instead of ending
-      }
-    } else if (themesAllClosed(args.state.closedThemes)) {
-      // allow propose_end path later
+      nextSpeakerRoleKey = pickPerspectiveOfficer({
+        availableRoleKeys: args.availableRoleKeys,
+        recentRoleKeys: recentBoardRoleKeys(args.state.messages),
+        themeLabel: nxt,
+      });
+      nominateReason = `次のテーマ「${nxt}」を開始`;
+      chairUtterance = `${themeCloseUtterance(previousTheme)} 次は「${nxt}」です。`;
+    } else if (args.state.unresolvedIssues.length === 0) {
       chairUtterance =
         chairUtterance?.trim() ||
-        "主要論点は一通り整理できました。終了してよいですか？";
+        `${themeCloseUtterance(previousTheme)} 未解決Issueは一通り整理できました。終了してよいですか？`;
       if (args.action !== "propose_end") {
         action = "propose_end";
       }
     }
+    args.state.priorityIssues = args.state.unresolvedIssues.slice(0, 4);
     return {
       action,
       nextSpeakerRoleKey,
@@ -1208,28 +1488,51 @@ function applyThemeFacilitation(args: {
     };
   }
 
-  // Stay on theme: prefer focus speakers
-  if (action === "nominate" || action === "rare_interrupt") {
-    const focus = themeDef(active).focusRoleKeys;
-    const asker = lastBoardSpeakerRoleKey(args.state.messages);
-    if (
-      !nextSpeakerRoleKey ||
-      !focus.includes(nextSpeakerRoleKey) ||
-      nextSpeakerRoleKey === asker
-    ) {
-      nextSpeakerRoleKey = pickFocusSpeaker(
-        active,
-        args.availableRoleKeys,
-        asker,
-      );
-      nominateReason =
-        nominateReason ||
-        `現在の論点「${themeDef(active).label}」を深掘り`;
+  const asker = lastBoardSpeakerRoleKey(args.state.messages);
+  const recent = recentBoardRoleKeys(args.state.messages);
+  const uniqueRecent = Array.from(new Set(recent.slice(-6)));
+  const stalled =
+    uniqueRecent.length > 0 &&
+    uniqueRecent.length <= 2 &&
+    args.state.messages.filter(
+      (m) => m.speakerType === "board_member" || m.speakerType === "executive",
+    ).length >= 3;
+
+  // One theme, many perspectives — but NEVER overwrite an explicit CEO nomination
+  const ceoLock = detectCeoExplicitNomination({
+    nextSpeakerRoleKey: args.nextSpeakerRoleKey,
+    chairUtterance: args.chairUtterance,
+    nominateReason: args.nominateReason,
+    availableRoleKeys: args.availableRoleKeys,
+  });
+  if (ceoLock) {
+    nextSpeakerRoleKey = ceoLock.roleKey;
+  } else if (action === "nominate" || action === "rare_interrupt" || stalled) {
+    const monopoly = detectThemeMonopoly({ recentRoleKeys: recent });
+    const next = pickPerspectiveOfficer({
+      availableRoleKeys: args.availableRoleKeys,
+      recentRoleKeys: recent,
+      avoidRoleKey: asker,
+      themeLabel: active,
+      banRoleKey: monopoly.monopolized ? monopoly.roleKey : null,
+    });
+    if (next) {
+      nextSpeakerRoleKey = next;
+      const angle = perspectiveHint(next);
+      nominateReason = `テーマ「${active}」への${angle}`;
+      if (
+        (stalled || monopoly.monopolized) &&
+        (!chairUtterance ||
+          chairUtterance.length < 8 ||
+          /CFO.*お願い|引き続きCFO/.test(chairUtterance))
+      ) {
+        action = "nominate";
+        chairUtterance = broadenPerspectiveUtterance(active, next);
+      }
     }
   }
 
-  // Sync priorityIssues to current theme label only
-  args.state.priorityIssues = [themeDef(active).label];
+  args.state.priorityIssues = args.state.unresolvedIssues.slice(0, 4);
 
   return {
     action,
@@ -1240,15 +1543,22 @@ function applyThemeFacilitation(args: {
   };
 }
 
-function DISCUSSION_THEME_ORDER_INDEX(id: DiscussionThemeId): number {
-  const order = ["profit", "customer", "operations", "brand"] as const;
-  const idx = order.indexOf(id);
-  return idx < 0 ? 0 : idx;
+function recentBoardRoleKeys(messages: DiscussionMessage[]): string[] {
+  return messages
+    .filter(
+      (m) =>
+        (m.speakerType === "board_member" || m.speakerType === "executive") &&
+        m.roleKey,
+    )
+    .map((m) => m.roleKey!)
+    .slice(-8);
 }
 
 /**
- * Hard guard: never re-ask RESOLVED / same ANSWERED / already-OPEN questions.
- * Converts ask_proposer/chair_nudge to nominate when the utterance is a repeat.
+ * Hard guard: never re-ask RESOLVED / ANSWERED / OPEN, and never repeat
+ * the same CEO facilitate/nominate utterance (paraphrase included).
+ * Converts ask_proposer/chair_nudge/nominate-with-repeat to nominate without
+ * reusing the same chairUtterance.
  */
 function guardRepeatedCeoQuestion(
   state: WallChatState,
@@ -1259,83 +1569,16 @@ function guardRepeatedCeoQuestion(
   action: DiscussionFacilitatorOutput["action"];
   chairUtterance: string | null;
   nominateReason: string;
+  suppressed: boolean;
 } {
-  const asAction = (
-    value: string,
-  ): DiscussionFacilitatorOutput["action"] => {
-    if (
-      value === "nominate" ||
-      value === "ask_proposer" ||
-      value === "chair_nudge" ||
-      value === "propose_end" ||
-      value === "rare_interrupt"
-    ) {
-      return value;
-    }
-    return "nominate";
-  };
-
-  if (action !== "ask_proposer" && action !== "chair_nudge") {
-    return {
-      action: asAction(action),
-      chairUtterance,
-      nominateReason,
-    };
-  }
-  const utter = (chairUtterance ?? "").trim();
-  if (!utter) {
-    return {
-      action: asAction(action),
-      chairUtterance,
-      nominateReason,
-    };
-  }
-
-  const resolvedHit = findSimilarCeoQuestion(state.ceoQuestions, utter, [
-    "RESOLVED",
-  ]);
-  if (resolvedHit) {
-    const focus = focusTopicFromState(state);
-    return {
-      action: "nominate",
-      chairUtterance: null,
-      nominateReason: focus
-        ? `RESOLVED質問の再掲を避け、論点「${focus.label}」を前進`
-        : "RESOLVED質問の再掲を避け、新しい論点へ進む",
-    };
-  }
-
-  const answeredHit = findSimilarCeoQuestion(state.ceoQuestions, utter, [
-    "ANSWERED",
-  ]);
-  if (answeredHit) {
-    const focus = focusTopicFromState(state);
-    return {
-      action: "nominate",
-      chairUtterance: null,
-      nominateReason: focus
-        ? `回答済み質問の繰り返し禁止。論点「${focus.label}」を別角度で前進`
-        : "回答済み質問の繰り返し禁止。新しい論点へ進む",
-    };
-  }
-
-  const openHit = findSimilarCeoQuestion(state.ceoQuestions, utter, ["OPEN"]);
-  if (openHit && action === "ask_proposer") {
-    const focus = focusTopicFromState(state);
-    return {
-      action: "nominate",
-      chairUtterance: null,
-      nominateReason: focus
-        ? `OPEN質問の回答待ちの間に「${focus.label}」を前進`
-        : "OPEN質問の回答待ち。別視点で前進",
-    };
-  }
-
-  return {
-    action: asAction(action),
+  const focus = focusTopicFromState(state);
+  return guardRepeatedCeoQuestionCore(
+    state,
+    action,
     chairUtterance,
     nominateReason,
-  };
+    focus?.label ?? state.activeTheme,
+  );
 }
 
 /** @deprecated use applyMeetingMemory */
@@ -1486,6 +1729,7 @@ export async function prepareDiscussionTurn(args: {
     };
   }
 
+  let facilitatorJsonFailed = false;
   let facilitation: Awaited<ReturnType<typeof runDiscussionFacilitator>>;
   try {
     facilitation = await runDiscussionFacilitator({
@@ -1500,12 +1744,13 @@ export async function prepareDiscussionTurn(args: {
       planVersions: state.planVersions,
       openTopics: state.openTopics,
       priorityIssues: state.priorityIssues,
+      unresolvedIssues: state.unresolvedIssues,
+      resolvedIssues: state.resolvedIssues,
       ceoQuestions: state.ceoQuestions,
       decisions: state.decisions,
       rejectedItems: state.rejectedItems,
       lastSpeakerRoleKey: lastBoardSpeakerRoleKey(state.messages),
       activeTheme: state.activeTheme,
-      closedThemes: state.closedThemes,
       signal: args.signal,
     });
   } catch (error) {
@@ -1519,6 +1764,7 @@ export async function prepareDiscussionTurn(args: {
       "[Discussion] facilitator JSON failed (isolated) — continuing with fallback nominate",
       error instanceof Error ? error.message.slice(0, 200) : String(error),
     );
+    facilitatorJsonFailed = true;
     const fallbackRole = pickFallbackSpeaker(speakers, state.messages);
     const focus = focusTopicFromState(state);
     facilitation = {
@@ -1543,6 +1789,8 @@ export async function prepareDiscussionTurn(args: {
               },
             ],
       priorityIssues: derivePriorityIssues(state.openTopics, state.priorityIssues),
+      unresolvedIssues: state.unresolvedIssues,
+      resolvedIssues: state.resolvedIssues,
       ceoQuestions: state.ceoQuestions,
       decisions: state.decisions,
       rejectedItems: state.rejectedItems,
@@ -1562,9 +1810,12 @@ export async function prepareDiscussionTurn(args: {
       facilitation.openTopics,
       facilitation.priorityIssues,
     ),
+    unresolvedIssues: facilitation.unresolvedIssues,
+    resolvedIssues: facilitation.resolvedIssues,
     ceoQuestions: facilitation.ceoQuestions,
     decisions: facilitation.decisions,
     rejectedItems: facilitation.rejectedItems,
+    activeTheme: facilitation.activeTheme,
   });
 
   const lastUtterance = lastMeaningfulUtterance(state.messages);
@@ -1584,7 +1835,8 @@ export async function prepareDiscussionTurn(args: {
   const canProposeEnd =
     (themeGate.action === "propose_end" ||
       facilitation.action === "propose_end") &&
-    themesAllClosed(state.closedThemes);
+    state.unresolvedIssues.length === 0 &&
+    (state.resolvedIssues.length > 0 || topicsAllResolved(state.openTopics));
 
   // End only when the CEO issue board is fully resolved — never by turn count.
   if (canProposeEnd) {
@@ -1645,34 +1897,48 @@ export async function prepareDiscussionTurn(args: {
         : null;
   if (
     (facilitation.action === "propose_end" || themeGate.action === "propose_end") &&
-    !themesAllClosed(state.closedThemes)
+    state.unresolvedIssues.length > 0
   ) {
-    // Not all themes closed — continue current/next theme instead of ending
+    // Unresolved issues remain — continue current theme instead of ending
     forcedAction = "nominate";
-    const focusRole = pickFocusSpeaker(
-      state.activeTheme,
+    const focusRole = pickPerspectiveOfficer({
       availableRoleKeys,
-      lastBoardSpeakerRoleKey(state.messages),
-    );
+      recentRoleKeys: recentBoardRoleKeys(state.messages),
+      avoidRoleKey: lastBoardSpeakerRoleKey(state.messages),
+      themeLabel: state.activeTheme,
+    });
     routedNextSpeaker = focusRole;
-    forcedNominateReason = `論点「${themeDef(state.activeTheme).label}」を継続`;
+    forcedNominateReason = `テーマ「${state.activeTheme}」を多視点で継続`;
     if (!themeGate.closedNow) {
       forcedChairUtterance =
         forcedChairUtterance ||
-        `まだ「${themeDef(state.activeTheme).label}」が残っています。続けましょう。`;
+        `まだ未解決Issueがあります。テーマ「${state.activeTheme}」を続けましょう。`;
     }
   }
 
+  let chairUtteranceSuppressed = false;
+  const ceoExplicitLock = detectCeoExplicitNomination({
+    nextSpeakerRoleKey:
+      facilitation.nextSpeakerRoleKey &&
+      speakerByRole.has(facilitation.nextSpeakerRoleKey)
+        ? facilitation.nextSpeakerRoleKey
+        : routedNextSpeaker,
+    chairUtterance: forcedChairUtterance ?? facilitation.chairUtterance,
+    nominateReason: forcedNominateReason,
+    availableRoleKeys,
+  });
   {
+    const inputChair = forcedChairUtterance ?? facilitation.chairUtterance;
     const guarded = guardRepeatedCeoQuestion(
       state,
       forcedAction,
-      forcedChairUtterance ?? facilitation.chairUtterance,
+      inputChair,
       forcedNominateReason,
     );
     forcedAction = guarded.action;
     forcedChairUtterance = guarded.chairUtterance;
     forcedNominateReason = guarded.nominateReason;
+    if (guarded.suppressed) chairUtteranceSuppressed = true;
   }
 
   {
@@ -1682,8 +1948,11 @@ export async function prepareDiscussionTurn(args: {
       action: forcedAction,
       nextSpeakerRoleKey: routedNextSpeaker,
       nominateReason: forcedNominateReason,
-      chairUtterance: forcedChairUtterance ?? facilitation.chairUtterance,
+      chairUtterance: chairUtteranceSuppressed
+        ? forcedChairUtterance
+        : (forcedChairUtterance ?? facilitation.chairUtterance),
       routingKind: facilitation.routingKind,
+      nominationLocked: Boolean(ceoExplicitLock),
     });
     forcedAction = routed.action;
     forcedNominateReason = routed.nominateReason;
@@ -1691,37 +1960,104 @@ export async function prepareDiscussionTurn(args: {
     routedNextSpeaker = routed.nextSpeakerRoleKey;
   }
 
-  // Keep nomination inside the active theme's focus roles
-  if (forcedAction === "nominate" || forcedAction === "rare_interrupt") {
+  // Priority-aware next speaker (proposer > CEO > addressed > auto > missing)
+  {
     const asker = lastBoardSpeakerRoleKey(state.messages);
-    const focusPick = pickFocusSpeaker(
-      state.activeTheme,
+    const recent = recentBoardRoleKeys(state.messages);
+    const missingPick = pickPerspectiveOfficer({
       availableRoleKeys,
-      asker,
-    );
-    if (
-      focusPick &&
-      (!routedNextSpeaker ||
-        !themeDef(state.activeTheme).focusRoleKeys.includes(routedNextSpeaker) ||
-        routedNextSpeaker === asker)
-    ) {
-      routedNextSpeaker = focusPick;
-      forcedNominateReason =
-        forcedNominateReason ||
-        `現在の論点「${themeDef(state.activeTheme).label}」`;
+      recentRoleKeys: recent,
+      avoidRoleKey: asker,
+      themeLabel: state.activeTheme,
+    });
+    const resolved = resolveNextSpeaker({
+      availableRoleKeys,
+      messages: state.messages,
+      facilitatorNextSpeaker:
+        ceoExplicitLock?.roleKey ??
+        facilitation.nextSpeakerRoleKey ??
+        routedNextSpeaker,
+      chairUtterance: forcedChairUtterance ?? facilitation.chairUtterance,
+      nominateReason: forcedNominateReason,
+      autoCandidate: routedNextSpeaker,
+      missingPerspectivePick: missingPick,
+      askerRole: asker,
+    });
+    if (resolved.roleKey) {
+      routedNextSpeaker = resolved.roleKey;
+    }
+    if (resolved.overrideReason) {
+      forcedChairUtterance =
+        forcedChairUtterance?.trim() || resolved.overrideReason;
+      chairUtteranceSuppressed = false;
+      forcedNominateReason = resolved.overrideReason;
+    }
+    // Locked CEO/proposer nomination: do not run monopoly auto-rotate below
+    if (resolved.locked) {
+      // skip needRotate block by marking via forced reason only
+    } else if (forcedAction === "nominate" || forcedAction === "rare_interrupt") {
+      const monopoly = detectThemeMonopoly({ recentRoleKeys: recent });
+      const routedHeavy =
+        routedNextSpeaker &&
+        recent.slice(-3).filter((r) => r === routedNextSpeaker).length >= 2;
+      const needRotate =
+        !routedNextSpeaker ||
+        routedNextSpeaker === asker ||
+        monopoly.monopolized ||
+        Boolean(routedHeavy);
+
+      if (needRotate) {
+        const focusPick = pickPerspectiveOfficer({
+          availableRoleKeys,
+          recentRoleKeys: recent,
+          avoidRoleKey: asker,
+          themeLabel: state.activeTheme,
+          banRoleKey: monopoly.monopolized
+            ? monopoly.roleKey
+            : routedHeavy
+              ? routedNextSpeaker
+              : null,
+        });
+        if (focusPick) {
+          const intended = routedNextSpeaker;
+          routedNextSpeaker = focusPick;
+          forcedNominateReason = `テーマ「${state.activeTheme}」への${perspectiveHint(focusPick)}`;
+          if (intended && intended !== focusPick && monopoly.monopolized) {
+            forcedChairUtterance = formatNominationOverrideNotice(
+              intended,
+              focusPick,
+              "同一役員の連続を避け多視点で前進",
+            );
+            chairUtteranceSuppressed = false;
+          } else if (
+            monopoly.monopolized &&
+            (!forcedChairUtterance ||
+              /CFO.*お願い|引き続きCFO|具体的な数字/.test(
+                forcedChairUtterance,
+              ))
+          ) {
+            forcedChairUtterance = broadenPerspectiveUtterance(
+              state.activeTheme,
+              focusPick,
+            );
+          }
+        }
+      }
     }
   }
 
-  // If theme park produced chair_nudge, honor it
+  // If theme gate produced chair_nudge, honor it
   if (themeGate.action === "chair_nudge" && themeGate.chairUtterance) {
     forcedAction = "chair_nudge";
     forcedChairUtterance = themeGate.chairUtterance;
     forcedNominateReason = themeGate.nominateReason;
+    chairUtteranceSuppressed = false;
   }
 
   // Preserve close-and-advance announcement
   if (themeGate.closedNow && themeGate.chairUtterance) {
     forcedChairUtterance = themeGate.chairUtterance;
+    chairUtteranceSuppressed = false;
     if (themeGate.action === "nominate") {
       forcedAction = "nominate";
       if (themeGate.nextSpeakerRoleKey) {
@@ -1731,13 +2067,37 @@ export async function prepareDiscussionTurn(args: {
     }
   }
 
+  // Final pass: block any resurrected / paraphrased CEO question
+  {
+    const candidate = chairUtteranceSuppressed
+      ? forcedChairUtterance
+      : (forcedChairUtterance ?? facilitation.chairUtterance);
+    const guarded = guardRepeatedCeoQuestion(
+      state,
+      forcedAction,
+      candidate,
+      forcedNominateReason,
+    );
+    forcedAction = guarded.action;
+    forcedChairUtterance = guarded.chairUtterance;
+    forcedNominateReason = guarded.nominateReason;
+    if (guarded.suppressed) chairUtteranceSuppressed = true;
+  }
+
   if (forcedAction === "ask_proposer") {
     let chairMessage: DiscussionMessage | null = null;
-    if (forcedChairUtterance?.trim() || facilitation.chairUtterance?.trim()) {
-      const askText = (forcedChairUtterance ?? facilitation.chairUtterance)!.slice(
-        0,
-        150,
-      );
+    const askText = (
+      (chairUtteranceSuppressed
+        ? forcedChairUtterance
+        : forcedChairUtterance ?? facilitation.chairUtterance) ?? ""
+    )
+      .trim()
+      .slice(0, 150);
+    if (askText && !isRepeatedCeoChairUtterance({
+      ceoQuestions: state.ceoQuestions,
+      messages: state.messages,
+      text: askText,
+    })) {
       registerOpenCeoQuestion(state, askText);
       chairMessage = pushMessage(state, {
         speakerType: "chair",
@@ -1756,63 +2116,112 @@ export async function prepareDiscussionTurn(args: {
           rejectedItems: state.rejectedItems,
         },
       });
+      state.activeGenerationId = null;
+      state.pendingSpeak = null;
+      runDebuggerPass(
+        state,
+        args.reviewLevel,
+        {
+          lastFacilitatorAction: "ask_proposer",
+          lastRoutedRole: null,
+          lastAskerRole: lastBoardSpeakerRoleKey(state.messages),
+          facilitatorJsonFailed,
+        },
+        availableRoleKeys,
+      );
+      await persistDiscussion(roundId, args.meetingId, state);
+      await prisma.meeting.update({
+        where: { id: args.meetingId },
+        data: {
+          status: MEETING_STATUS.AWAITING_DISCUSSION,
+          currentStep: MEETING_STEP.DISCUSSION,
+          errorMessage: null,
+        },
+      });
+      return {
+        status: "awaiting_proposer",
+        generationId: null,
+        speaker: null,
+        thinkingTitle: null,
+        thinkingLine: null,
+        chairMessage,
+        summary: publicState(state),
+      };
     }
-    state.activeGenerationId = null;
-    state.pendingSpeak = null;
-    await persistDiscussion(roundId, args.meetingId, state);
-    await prisma.meeting.update({
-      where: { id: args.meetingId },
-      data: {
-        status: MEETING_STATUS.AWAITING_DISCUSSION,
-        currentStep: MEETING_STEP.DISCUSSION,
-        errorMessage: null,
-      },
-    });
-    return {
-      status: "awaiting_proposer",
-      generationId: null,
-      speaker: null,
-      thinkingTitle: null,
-      thinkingLine: null,
-      chairMessage,
-      summary: publicState(state),
-    };
+    // Fall through to officer debate instead of re-asking
+    forcedAction = "nominate";
+    forcedChairUtterance = null;
+    chairUtteranceSuppressed = true;
   }
 
   if (forcedAction === "chair_nudge") {
-    const text =
-      forcedChairUtterance?.trim() ||
-      facilitation.chairUtterance?.trim() ||
-      "ちょっと待って。今の話、企画者はどう思う？";
-    const chairMessage = pushMessage(state, {
-      speakerType: "chair",
-      roleKey: chair.roleKey,
-      title: chair.title,
-      text: text.slice(0, 150),
-      moveType: "question",
-      nominateReason: forcedNominateReason,
-      kind: "chat",
-      messageType: "chair_nudge",
-      metadata: {
-        openTopics: state.openTopics,
-        priorityIssues: state.priorityIssues,
+    const text = (
+      (chairUtteranceSuppressed
+        ? forcedChairUtterance
+        : forcedChairUtterance ?? facilitation.chairUtterance) ??
+      "ちょっと待って。今の話、企画者はどう思う？"
+    ).trim();
+    if (
+      isRepeatedCeoChairUtterance({
         ceoQuestions: state.ceoQuestions,
-        decisions: state.decisions,
-        rejectedItems: state.rejectedItems,
-      },
-    });
-    state.activeGenerationId = null;
-    state.pendingSpeak = null;
-    await persistDiscussion(roundId, args.meetingId, state);
-    return {
-      status: "chair_only",
-      generationId: null,
-      speaker: null,
-      thinkingTitle: null,
-      thinkingLine: null,
-      chairMessage,
-      summary: publicState(state),
-    };
+        messages: state.messages,
+        text,
+      })
+    ) {
+      forcedAction = "nominate";
+      forcedChairUtterance = null;
+      chairUtteranceSuppressed = true;
+    } else {
+      registerOpenCeoQuestion(state, text);
+      const chairMessage = pushMessage(state, {
+        speakerType: "chair",
+        roleKey: chair.roleKey,
+        title: chair.title,
+        text: text.slice(0, 150),
+        moveType: "question",
+        nominateReason: forcedNominateReason,
+        kind: "chat",
+        messageType: "chair_nudge",
+        metadata: {
+          openTopics: state.openTopics,
+          priorityIssues: state.priorityIssues,
+          ceoQuestions: state.ceoQuestions,
+          decisions: state.decisions,
+          rejectedItems: state.rejectedItems,
+        },
+      });
+      state.activeGenerationId = null;
+      state.pendingSpeak = null;
+      runDebuggerPass(
+        state,
+        args.reviewLevel,
+        {
+          lastFacilitatorAction: "chair_nudge",
+          lastRoutedRole: routedNextSpeaker,
+          lastAskerRole: lastBoardSpeakerRoleKey(state.messages),
+          facilitatorJsonFailed,
+        },
+        availableRoleKeys,
+      );
+      await persistDiscussion(roundId, args.meetingId, state);
+      await prisma.meeting.update({
+        where: { id: args.meetingId },
+        data: {
+          status: MEETING_STATUS.AWAITING_DISCUSSION,
+          currentStep: MEETING_STEP.DISCUSSION,
+          errorMessage: null,
+        },
+      });
+      return {
+        status: "awaiting_proposer",
+        generationId: null,
+        speaker: null,
+        thinkingTitle: null,
+        thinkingLine: null,
+        chairMessage,
+        summary: publicState(state),
+      };
+    }
   }
 
   // nominate or rare_interrupt (or overridden propose_end → nominate)
@@ -1851,8 +2260,27 @@ export async function prepareDiscussionTurn(args: {
   }
 
   let chairMessage: DiscussionMessage | null = null;
-  const chairText = forcedChairUtterance?.trim() || facilitation.chairUtterance?.trim();
+  let chairText = (
+    chairUtteranceSuppressed
+      ? forcedChairUtterance?.trim() || ""
+      : forcedChairUtterance?.trim() || facilitation.chairUtterance?.trim() || ""
+  );
+  if (
+    chairText &&
+    isRepeatedCeoChairUtterance({
+      ceoQuestions: state.ceoQuestions,
+      messages: state.messages,
+      text: chairText,
+    })
+  ) {
+    chairText = "";
+    forcedChairUtterance = null;
+    forcedNominateReason =
+      forcedNominateReason ||
+      "同一司会発話の繰り返しを避け、別視点で前進";
+  }
   if (chairText) {
+    registerOpenCeoQuestion(state, chairText);
     chairMessage = pushMessage(state, {
       speakerType: "chair",
       roleKey: chair.roleKey,
@@ -1872,13 +2300,27 @@ export async function prepareDiscussionTurn(args: {
     });
   }
 
-  const line = pickThinkingLine(speaker.roleKey);
+  // Apply forced next speaker from prior debugger repair
+  if (
+    state.forcedNextRoleKey &&
+    speakerByRole.has(state.forcedNextRoleKey) &&
+    state.forcedNextRoleKey !== askerRole
+  ) {
+    const forced = speakerByRole.get(state.forcedNextRoleKey)!;
+    roleKey = forced.roleKey;
+  }
+
+  const line = pickThinkingLine(
+    (speakerByRole.get(roleKey) ?? speaker).roleKey,
+  );
   const focusTopic = focusTopicFromState(state);
+  const finalSpeaker = speakerByRole.get(roleKey) ?? speaker;
   state.activeGenerationId = generationId;
   state.pendingSpeak = {
     generationId,
-    roleKey: speaker.roleKey,
+    roleKey: finalSpeaker.roleKey,
     nominateReason:
+      state.forcedNominateReason ||
       forcedNominateReason ||
       (focusTopic
         ? `重要論点「${focusTopic.label}」への視点`
@@ -1887,6 +2329,21 @@ export async function prepareDiscussionTurn(args: {
     rareInterruptRoleKey,
     action: forcedAction === "propose_end" ? "nominate" : forcedAction,
   };
+  // Consume one-shot debugger force
+  state.forcedNextRoleKey = null;
+  state.forcedNominateReason = null;
+
+  runDebuggerPass(
+    state,
+    args.reviewLevel,
+    {
+      lastFacilitatorAction: forcedAction,
+      lastRoutedRole: finalSpeaker.roleKey,
+      lastAskerRole: askerRole,
+      facilitatorJsonFailed,
+    },
+    availableRoleKeys,
+  );
 
   await persistDiscussion(roundId, args.meetingId, state, {
     appendStatement: chairMessage ? undefined : false,
@@ -1904,8 +2361,8 @@ export async function prepareDiscussionTurn(args: {
   return {
     status: "ready",
     generationId,
-    speaker: { roleKey: speaker.roleKey, title: speaker.title },
-    thinkingTitle: thinkingTitle(speaker.title),
+    speaker: { roleKey: finalSpeaker.roleKey, title: finalSpeaker.title },
+    thinkingTitle: thinkingTitle(finalSpeaker.title),
     thinkingLine: line,
     chairMessage,
     summary: publicState(state),
@@ -1983,7 +2440,7 @@ export async function speakDiscussionTurn(args: {
       proposerAnswers: proposerAnswersFromMessages(state.messages),
       chairNotes: chairNotesFromMessages(state.messages),
       activeTheme: state.activeTheme,
-      activeThemeLabel: themeDef(state.activeTheme).label,
+      activeThemeLabel: state.activeTheme,
       signal: args.signal,
     });
   } catch (error) {
@@ -1995,6 +2452,12 @@ export async function speakDiscussionTurn(args: {
       if (state.activeGenerationId === args.generationId) {
         state.activeGenerationId = null;
         state.pendingSpeak = null;
+        runDebuggerPass(
+          state,
+          args.reviewLevel,
+          { apiTimeout: true },
+          speakers.map((s) => s.roleKey),
+        );
         await persistDiscussion(roundId, args.meetingId, state, {
           appendStatement: false,
         });
@@ -2015,6 +2478,15 @@ export async function speakDiscussionTurn(args: {
     fresh.state.activeGenerationId !== args.generationId ||
     fresh.state.pendingSpeak?.generationId !== args.generationId
   ) {
+    runDebuggerPass(
+      fresh.state,
+      args.reviewLevel,
+      { staleResponseDiscarded: true },
+      speakers.map((s) => s.roleKey),
+    );
+    await persistDiscussion(fresh.roundId, args.meetingId, fresh.state, {
+      appendStatement: false,
+    });
     return {
       status: "stale",
       message: null,
@@ -2024,19 +2496,46 @@ export async function speakDiscussionTurn(args: {
   }
 
   const liveState = fresh.state;
+  const prevText = [...liveState.messages]
+    .reverse()
+    .find(
+      (m) =>
+        m.kind !== "diagnostic" &&
+        (m.speakerType === "board_member" || m.speakerType === "executive"),
+    )?.text;
+  const duplicateResponseDetected = Boolean(
+    prevText && prevText === utterance.text.slice(0, 150),
+  );
+  const answeringCeoNomination = Boolean(
+    pending.nominateReason || pending.chairUtterance,
+  );
+  const address = normalizeUtteranceAddress({
+    text: utterance.text,
+    moveType: utterance.moveType,
+    speakerRoleKey: speaker.roleKey,
+    availableRoleKeys: speakers.map((s) => s.roleKey),
+    addressTo: utterance.addressTo,
+    addressRoleKey: utterance.addressRoleKey,
+    targetType: utterance.targetType,
+    targetParticipantId: utterance.targetParticipantId,
+    answeringCeoNomination,
+  });
   const message = pushMessage(liveState, {
     speakerType: "board_member",
     roleKey: speaker.roleKey,
     title: speaker.title,
     speakerId: speaker.id,
     text: utterance.text.slice(0, 150),
-    addressTo: utterance.addressTo,
-    addressRoleKey: utterance.addressRoleKey,
+    addressTo: address.addressTo,
+    addressRoleKey: address.addressRoleKey,
+    targetType: address.targetType,
+    targetParticipantId: address.targetParticipantId,
     moveType: utterance.moveType,
     nominateReason: pending.nominateReason,
     kind: "chat",
     messageType: utterance.moveType,
   });
+  markOpenQuestionsAnsweredByOfficerProgress(liveState, utterance.text);
 
   let interruptQueued = false;
   if (pending.rareInterruptRoleKey) {
@@ -2066,6 +2565,13 @@ export async function speakDiscussionTurn(args: {
 
   liveState.activeGenerationId = null;
   liveState.pendingSpeak = null;
+
+  runDebuggerPass(
+    liveState,
+    args.reviewLevel,
+    { duplicateResponseDetected },
+    speakers.map((s) => s.roleKey),
+  );
 
   await persistDiscussion(fresh.roundId, args.meetingId, liveState);
 
@@ -2534,14 +3040,106 @@ export async function controlDiscussion(args: {
     | "change_topic"
     | "proceed"
     | "confirm_end"
-    | "cancel_end";
+    | "cancel_end"
+    | "set_debugger_mode"
+    | "debugger_repair"
+    | "debugger_ignore";
   reviewLevel: ReviewLevel;
   note?: string;
+  debuggerMode?: DebuggerMode;
+  findingId?: string;
+  repairAction?: "auto" | "confirm" | "ignore";
 }): Promise<{ summary: ReturnType<typeof publicState>; ended?: boolean }> {
   const { chair, speakers, project, company } = await loadDiscussionContext(
     args.meetingId,
   );
   const { roundId, state } = await ensureRound(args.meetingId, project);
+  const availableRoleKeys = speakers.map((s) => s.roleKey);
+
+  if (args.action === "set_debugger_mode") {
+    const mode = args.debuggerMode ?? "PASSIVE";
+    state.debugger.mode = mode;
+    if (mode === "OFF") {
+      // Keep history but stop new cards
+    }
+    await persistDiscussion(roundId, args.meetingId, state, {
+      appendStatement: false,
+    });
+    return { summary: publicState(state) };
+  }
+
+  if (args.action === "debugger_ignore" || args.action === "debugger_repair") {
+    const findingId = args.findingId;
+    const finding = state.debugger.findings.find((f) => f.id === findingId);
+    if (!finding) {
+      return { summary: publicState(state) };
+    }
+    if (args.action === "debugger_ignore" || args.repairAction === "ignore") {
+      finding.status = "ignored";
+      state.debugger.repairLog = [
+        ...state.debugger.repairLog,
+        {
+          at: new Date().toISOString(),
+          findingId: finding.id,
+          action: "ignore" as const,
+          note: "ユーザーが無視",
+          repairKind: finding.repairKind,
+        },
+      ].slice(-40);
+      // Mark matching timeline card as ignored via metadata (leave text)
+      for (const m of state.messages) {
+        if (m.kind === "diagnostic" && m.diagnostic?.id === finding.id) {
+          m.diagnostic = { ...finding };
+          m.metadata = { ...m.metadata, ignored: true };
+        }
+      }
+    } else {
+      const result = applySafeRepair({
+        finding,
+        action: args.repairAction === "auto" ? "auto" : "confirm",
+        state,
+        availableRoleKeys,
+        recentRoleKeys: recentBoardRoleKeys(state.messages),
+      });
+      finding.status =
+        args.repairAction === "auto" ? "auto_repaired" : "confirmed_repaired";
+      finding.repairedAt = new Date().toISOString();
+      state.debugger.repairLog = [
+        ...state.debugger.repairLog,
+        {
+          at: finding.repairedAt,
+          findingId: finding.id,
+          action: (args.repairAction === "auto" ? "auto" : "confirm") as
+            | "auto"
+            | "confirm",
+          note: result.note,
+          repairKind: finding.repairKind,
+        },
+      ].slice(-40);
+      for (const m of state.messages) {
+        if (m.kind === "diagnostic" && m.diagnostic?.id === finding.id) {
+          m.diagnostic = { ...finding };
+          m.text = `${m.text}\n\n修復: ${result.note}`.slice(0, 450);
+        }
+      }
+      if (result.chairUtterance) {
+        pushMessage(state, {
+          speakerType: "chair",
+          roleKey: chair.roleKey,
+          title: chair.title,
+          text: result.chairUtterance.slice(0, 150),
+          kind: "chat",
+          messageType: "debugger_repair",
+        });
+      }
+    }
+    state.debugger.scores = computeQualityScores(
+      buildAnalyzeContext(state, args.reviewLevel),
+      state.debugger,
+    );
+    await persistDiscussion(roundId, args.meetingId, state);
+    return { summary: publicState(state) };
+  }
 
   if (args.action === "pause") {
     state.paused = true;
@@ -2600,6 +3198,7 @@ export async function controlDiscussion(args: {
       kind: "chat",
       messageType: "end",
     });
+    pushDebuggerSummary(state, args.reviewLevel);
     state.awaitingEndConfirm = false;
     state.paused = false;
     state.activeGenerationId = null;

@@ -1,4 +1,5 @@
 import {
+  formatConversationMember,
   formatMember,
   prompts,
   type CompanyContext,
@@ -26,6 +27,15 @@ function memberSystem(member: MemberContext): string {
   return buildSystemPrompt(
     `あなたは「${member.title}」です。\n${formatMember(member)}`,
   );
+}
+
+function conversationMemberSystem(member: MemberContext): string {
+  return [
+    `あなたは企業の役員会に参加する「${member.title}」です。`,
+    "レビュー文書は書かない。自然な会話の一言だけ返す。",
+    "良い点・懸念・改善案・期待効果・まとめなどの見出しや箇条書きは禁止。",
+    formatConversationMember(member),
+  ].join("\n");
 }
 
 export async function runInitialReview(args: {
@@ -133,7 +143,7 @@ export async function runDiscussionUtterance(args: {
   signal?: AbortSignal;
 }): Promise<DiscussionUtteranceOutput> {
   return generateStructuredJson({
-    system: memberSystem(args.member),
+    system: conversationMemberSystem(args.member),
     user: prompts.discussionUtteranceUser({
       company: args.company,
       project: args.project,

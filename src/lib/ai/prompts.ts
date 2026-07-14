@@ -14,6 +14,7 @@ import {
   STANCE_DECISION_RULES,
   type ReviewLevel,
 } from "./role-focus";
+import { formatThemePerspectivesForPrompt } from "@/lib/meeting/discussion-themes";
 
 export type CompanyContext = {
   name: string;
@@ -104,6 +105,36 @@ export function formatMember(member: MemberContext): string {
     lines.push(QRIMO_SIMPLY_RULES);
     lines.push(CEO_EDITOR_RULES);
     lines.push(CHAIR_FACILITATOR_RULES);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Member context for live wall-chat utterances.
+ * Excludes Step2 review templates (良い点/懸念/改善案/期待効果/票).
+ */
+export function formatConversationMember(member: MemberContext): string {
+  const conversationBehavior = member.behaviorRules.filter(
+    (rule) =>
+      !/良い点|懸念|改善案|期待効果|レビュー|票|質問は最大/.test(rule),
+  );
+  const lines = [
+    `役職: ${member.title}`,
+    `役割キー: ${member.roleKey}`,
+    `説明: ${member.description}`,
+    `関心の視点（会話で使う）: ${member.priorities.slice(0, 4).join("、")}`,
+    getRoleFocus(member.roleKey),
+    QRIMO_VALUES,
+    DISCUSSION_RULES,
+  ];
+  if (conversationBehavior.length > 0) {
+    lines.push(
+      `話し方のヒント:\n${conversationBehavior.map((r) => `- ${r}`).join("\n")}`,
+    );
+  }
+  if (member.roleKey === "quality_balancer") {
+    lines.push(QUALITY_BALANCER_RULES);
+    lines.push(QRIMO_SIMPLY_RULES);
   }
   return lines.join("\n");
 }
@@ -578,45 +609,61 @@ export const prompts = {
     planVersions: unknown[];
     openTopics: unknown[];
     priorityIssues: string[];
+    unresolvedIssues: string[];
+    resolvedIssues: string[];
     ceoQuestions: unknown[];
     decisions: string[];
     rejectedItems: string[];
     lastSpeakerRoleKey?: string | null;
     activeTheme?: string | null;
-    closedThemes?: string[];
   }): string {
+    const theme = args.activeTheme?.trim() || "利益性";
     return [
       "AI壁打ち会議の司会です。レビューは書かない。",
-      "担当は: 会議メモリ更新（決定/却下/未解決） / 論点整理 / 企画更新の徹底 / 収束 / 次の質問 / 発言順の指名。",
+      "担当は: 会議メモリ更新（テーマ/Issue） / 論点の前進 / 企画更新の徹底 / 収束 / 次の質問 / 指名。",
       CHAIR_FACILITATOR_RULES,
       DISCUSSION_RULES,
       "",
-      "【重要】終了は発言回数ではなく『全論点が解決したか』で判断する。回数上限はない。",
-      "【重要】毎ターン decisions / rejectedItems / openTopics / priorityIssues / ceoQuestions を必ず更新して返す。",
-      "【重要】RESOLVED質問と同趣旨の再質問は禁止。ANSWEREDは充足判定し、不足なら別文言の追加質問のみ。",
-      "【重要】毎ターン『新しい論点へ進む』か『残OPENを進める』を優先。同じ依頼の繰り返し禁止。",
-      "【最優先】現在の論点は1つだけ。順: 利益・ROI → 顧客 → 運用 → ブランド。同時進行禁止。",
-      "activeTheme / themeAction(continue|park_aside|close_and_advance) を毎ターン返す。",
-      "別論点が混ざったら themeAction=park_aside で『その論点は後ほど扱います』。",
-      "整理できたら close_and_advance で『この論点は整理できました』→次テーマ。",
+      "【重要】終了は発言回数ではなく『未解決Issueが空か』で判断する。回数上限はない。",
+      "【重要】毎ターン activeTheme / unresolvedIssues / resolvedIssues / decisions / rejectedItems / openTopics / ceoQuestions を更新して返す。",
+      "【重要】RESOLVED/ANSWERED/OPENと同趣旨の再質問・同一司会発話の言い換え反復は禁止。回答後は次の視点へ進む。不足なら別文言の追加質問のみ。",
+      "【最優先】固定議論順は禁止。テーマは1つ、視点は複数。Themeは役職専有ではない。",
+      "利益・ROIテーマでもCFO固定禁止。マーケ/顧客/CTO/現場/レッドチーム/Balancerも専門から発言。",
+      "今の発言が現在テーマの解決に役立つなら許可（顧客・ブランド・開発費・運用も根拠ならOK）。",
+      "役立たない脱線だけ軽く戻す。視点の多様性は歓迎。",
+      "議論が止まったら『〇〇の視点ではどうですか？』で広げてnominate。同一役員への連続指名禁止。",
+      "アイデア段階の詳細数値要求は禁止。不足なら ceoQuestions を PARKED にして構造確認へ。",
+      "activeTheme（自由ラベル）/ themeAction(continue|close_theme) を毎ターン返す。",
+      "テーマが十分整理できたら close_theme で『〇〇については概ね整理できました。』→未解決Issueから次テーマ。",
+      "テーマ変更はCEOだけ。役員はテーマを勝手に変えない。",
       "【次優先】役員同士の議論。企画者は情報提供者。毎回 ask_proposer しない。",
-      "優先: 1)現在テーマの役員同士 2)テーマ内の他役員 3)未提示事実だけask_proposer 4)合意後に修正依頼。",
-      "【質問ルーティング】役職名ではなく内容で決める。質問した本人へ同じ問いを返さない。",
-      "routingKind: plan_content|revenue_cost_premise|roi_calc|tech_feasibility|operations|customer_psychology|brand|other",
-      "roi_calc→cfo / tech→cto / operations→operations / customer→customer / brand→marketing（いずれもnominate）",
+      "優先: 1)現在テーマの役員同士（多視点） 2)未発言役員へ広げる 3)未提示事実だけask_proposer 4)合意後に修正依頼。",
+      "【質問ルーティング】役職名ではなく会議前進度で決める。質問した本人へ同じ問いを返さない。",
+      "routingKind は論点ラベルのみ。roi_calc でも nextSpeaker をCFO固定しない（多視点nominate）。",
       "plan_content/revenue_cost_premise でも、仮定で議論できるならnominate。未提示の事実が要るときだけask_proposer。",
       `指名可能な roleKey: ${args.availableRoleKeys.join(", ")}`,
       `直近の発言者 roleKey（この人へ同じ質問を返してはいけない）: ${args.lastSpeakerRoleKey ?? "なし"}`,
-      `現在の論点 activeTheme: ${args.activeTheme ?? "profit"}（これ以外は後ほど）`,
-      `終了済みテーマ closedThemes: ${(args.closedThemes ?? []).join(", ") || "なし"}`,
+      `現在のテーマ activeTheme: ${theme}`,
       "action:",
       "- nominate: 基本。役員同士で深掘り。質問者本人は禁止",
       "- ask_proposer: 稀。企画者しか知らない未提示事実、または複数役員合意後の修正依頼のみ",
       "- chair_nudge: 短い司会の一言。企画者への催促連発は禁止",
-      "- propose_end: 全論点が resolved のときだけ。勝手に終了しない（企画者承認が必要）",
+      "- propose_end: 未解決Issueが空のときだけ。勝手に終了しない（企画者承認が必要）",
       "- rare_interrupt: 稀に割り込み役を interruptRoleKey で指定（頻発禁止）",
       "",
       "## 会議メモリ（現行）※更新して返すこと",
+      "### 現在のテーマ",
+      theme,
+      formatThemePerspectivesForPrompt(theme),
+      "themeAction: continue | close_theme",
+      "### 未解決Issue unresolvedIssues",
+      args.unresolvedIssues.length > 0
+        ? JSON.stringify(args.unresolvedIssues, null, 2)
+        : "（空）会話から未解決を抽出して追加",
+      "### 解決済みIssue resolvedIssues",
+      args.resolvedIssues.length > 0
+        ? JSON.stringify(args.resolvedIssues, null, 2)
+        : "（まだなし）",
       "### 決定事項 decisions",
       args.decisions.length > 0
         ? JSON.stringify(args.decisions, null, 2)
@@ -625,26 +672,18 @@ export const prompts = {
       args.rejectedItems.length > 0
         ? JSON.stringify(args.rejectedItems, null, 2)
         : "（まだなし）明確に却下した案を追加。再提案禁止リスト",
-      "### 論点ボード openTopics（議論全体・最大12）",
+      "### 論点ボード openTopics（整合用・最大12）",
       args.openTopics.length > 0
         ? JSON.stringify(args.openTopics, null, 2)
-        : "（空）会話と企画から論点を抽出。status は unresolved / discussing / resolved。",
-      "### 重要論点 priorityIssues（画面表示・最大4・重要度順）",
-      args.priorityIssues.length > 0
-        ? JSON.stringify(args.priorityIssues, null, 2)
-        : "（空）openTopics のうち今すぐ深掘りすべきラベルを重要度順に最大4件。",
+        : "（空）unresolvedIssues/resolvedIssues と整合するよう status を更新。",
       "### 質問ボード ceoQuestions（OPEN/ANSWERED/RESOLVED/PARKED）",
       args.ceoQuestions.length > 0
         ? JSON.stringify(args.ceoQuestions, null, 2)
         : "（空）新しい質問は OPEN で追加。回答後は ANSWERED。十分なら RESOLVED。",
-      "### 現在の論点（1つのみ）",
-      `activeTheme=${args.activeTheme ?? "profit"} / closed=${JSON.stringify(args.closedThemes ?? [])}`,
-      "themeAction: continue | park_aside | close_and_advance",
       "",
       "openTopics status: unresolved | discussing | resolved",
       "ceoQuestions status: OPEN | ANSWERED | RESOLVED | PARKED",
-      "例: openTopics に多数あっても、priorityIssues は『価格』『現場教育』など今の焦点だけ。",
-      "繰り返しだけが続いている論点は repetitionDetected=true とし、その論点を resolved にしてよい。",
+      "繰り返しだけが続いている論点は repetitionDetected=true とし、resolvedIssues へ移してよい。",
       "未解決が残っているのに propose_end してはいけない。",
       "却下の再提案が出たら chair_nudge か指名で『決定事項を前提に別角度で』と止める。",
       "",
@@ -665,7 +704,7 @@ export const prompts = {
       JSON.stringify(args.transcript.slice(-24), null, 2),
       "",
       "JSON:",
-      '{ "action": "nominate"|"ask_proposer"|"chair_nudge"|"propose_end"|"rare_interrupt", "nextSpeakerRoleKey": string|null, "nominateReason": string, "chairUtterance": string|null, "endReason": string|null, "interruptRoleKey": string|null, "routingKind": "plan_content"|"revenue_cost_premise"|"roi_calc"|"tech_feasibility"|"operations"|"customer_psychology"|"brand"|"other"|null, "activeTheme": "profit"|"customer"|"operations"|"brand", "themeAction": "continue"|"park_aside"|"close_and_advance", "openTopics": [{ "id": string, "label": string, "status": "unresolved"|"discussing"|"resolved", "note": string|null }], "priorityIssues": string[], "ceoQuestions": [{ "id": string, "text": string, "status": "OPEN"|"ANSWERED"|"RESOLVED"|"PARKED", "note": string|null }], "decisions": string[], "rejectedItems": string[], "repetitionDetected": boolean }',
+      '{ "action": "nominate"|"ask_proposer"|"chair_nudge"|"propose_end"|"rare_interrupt", "nextSpeakerRoleKey": string|null, "nominateReason": string, "chairUtterance": string|null, "endReason": string|null, "interruptRoleKey": string|null, "routingKind": "plan_content"|"revenue_cost_premise"|"roi_calc"|"tech_feasibility"|"operations"|"customer_psychology"|"brand"|"other"|null, "activeTheme": string, "themeAction": "continue"|"close_theme", "unresolvedIssues": string[], "resolvedIssues": string[], "openTopics": [{ "id": string, "label": string, "status": "unresolved"|"discussing"|"resolved", "note": string|null }], "priorityIssues": string[], "ceoQuestions": [{ "id": string, "text": string, "status": "OPEN"|"ANSWERED"|"RESOLVED"|"PARKED", "note": string|null }], "decisions": string[], "rejectedItems": string[], "repetitionDetected": boolean }',
     ].join("\n");
   },
 
@@ -691,61 +730,50 @@ export const prompts = {
         ? `\n${QUALITY_BALANCER_RULES}`
         : "";
     return [
-      "AI壁打ち会議の発言です。レビュー禁止。自然な会話だけ。150文字以内。",
+      "壁打ち会議の発言です。レビュー文書は禁止。自然な口語の会話だけ。150文字以内。",
+      "絶対禁止: 「良い点」「懸念」「改善案」「期待効果」「まとめ」などの見出し、箇条書き、番号リスト。",
+      "返すのはこんな感じの会話だけ:",
+      "「なるほど、その前提なら現場負荷は問題なさそうですね。」",
+      "「それなら別の懸念があります。」",
+      "「私は逆にこう考えます。」",
+      "「その案なら私は賛成です。」",
+      "「ちょっと待って、その前提は違うと思います。」",
+      "「それ面白いですね。」",
+      "「じゃあ次はここを考えませんか？」",
       DISCUSSION_RULES,
       balancerExtra,
       `司会があなたを指名した理由: ${args.nominateReason}`,
-      "あなたは反対し続ける役ではない。専門家として評価→納得→前提更新→次論点へ進む。",
-      "企画者や他役員の十分な回答のあと、同じ反論を繰り返すのは禁止。",
-      "悪い例: 『マニュアルが必要』→説明あり→『でもマニュアルが必要』（禁止）",
-      "良い例: 『なるほど、その前提なら現場負荷は増えない。次はラウンジ混雑時の運用』",
-      "直近の会話に自分の懸念への回答があるなら、まず評価と納得を述べ、残るなら新角度だけ。",
-      `【現在の論点】${args.activeThemeLabel ?? args.activeTheme ?? "利益・ROI"} — この論点だけ話す。別論点は出さない（CEOが後ほど扱う）。`,
-      "利益論点でも、アイデア段階ならROI数字ではなく『仮説・価値・方向性』を話す。数字要求は稟議レベルのみ。",
-      "役員同士への建設的なぶつけ合いは歓迎。ただし受け止めと前進も必須。企画者だけに話しかけない。",
-      "同じ話の繰り返し禁止。決定事項を前提に、未解決論点を1歩進める発言だけ。",
-      "目的は企画を育てること。追い込み質問の連発は禁止。",
-      `必ず Version ${args.currentPlan.version} の企画だけを前提にする。旧版に戻るな。`,
-      "企画が更新された直後なら『その修正なら懸念は解消』『別の課題が見えてきた』で前へ進める。",
+      "反対し続ける役ではない。納得したら受け入れ、次の論点へ進む。",
+      `【現在のテーマ】${args.activeThemeLabel ?? args.activeTheme ?? "利益性"} — 会議全体の論点。あなた専用ではない。自分の専門からこのテーマへ貢献する。`,
+      "固定の議論順番はない。利益テーマなら購入意欲・ブランド・開発費・運用コストも根拠として話してよい。",
+      "同じ役員の言い換え反復は禁止。他役員の発言を受けて補完・反論・別案・納得・前進のいずれかをする。",
+      "アイデア段階ならROIの具体数字は求めず、仮説・価値・方向性の会話にする。数値不足はPARKED候補。",
+      `必ず Version ${args.currentPlan.version} の企画だけを前提にする。`,
       "moveType: question|counter|alternative|challenge_premise|expand|brake|accept|advance",
-      "十分な回答を受け入れて次へ行くときは accept または advance を使う。",
+      "納得して次へ行くときは accept または advance。",
+      "【宛先】targetType: proposer|executive|chair|all|none。executive のとき targetParticipantId に roleKey。",
+      "会議全体への見解・別案は all または none（企画者宛てにしない）。",
+      "企画者へ質問してよいのは企画者しか知らない意図・前提・正式決定だけ。",
+      "悪い例「例外対応が増えませんか？」→役員同士で議論。良い例「例外を認める設計を想定していますか？」→proposer。",
+      "毎回、判断／認識更新／別案／明確な質問／Issueを閉じる条件のいずれかを含める。「次は〜」だけで終わらない。",
       "",
-      "## 必読: 会議メモリ（これを無視した発言は禁止）",
-      `### 現在の企画概要 Version ${args.currentPlan.version}`,
-      args.currentPlan.summary,
-      "### 決定事項（前提。覆すな）",
-      args.decisions.length > 0
-        ? args.decisions.map((d) => `・${d}`).join("\n")
-        : "・（まだなし）",
-      "### 却下事項（再提案禁止）",
-      args.rejectedItems.length > 0
-        ? args.rejectedItems.map((d) => `・${d}`).join("\n")
-        : "・（まだなし）",
-      "### 未解決論点",
-      JSON.stringify(args.openTopics, null, 2),
-      "### CEO質問ボード（RESOLVEDは再質問禁止）",
-      JSON.stringify(args.ceoQuestions ?? [], null, 2),
-      "### 企画者の発言（抜粋）※十分な回答があれば受け入れて前進",
-      args.proposerAnswers.length > 0
-        ? args.proposerAnswers.map((t) => `- ${t}`).join("\n")
-        : "- （まだなし）",
-      "### CEOの論点整理（抜粋）",
-      args.chairNotes.length > 0
-        ? args.chairNotes.map((t) => `- ${t}`).join("\n")
-        : "- （まだなし）",
-      "",
-      "却下事項を言い換えて再提案しないこと。決定事項の上に立って次の問い・別案・深掘り・納得→前進をする。",
+      "## 会議の前提（会話の材料。見出し付きで返答するな）",
+      `企画 Version ${args.currentPlan.version}: ${args.currentPlan.summary}`,
+      `決定: ${(args.decisions.length ? args.decisions : ["（なし）"]).join(" / ")}`,
+      `却下: ${(args.rejectedItems.length ? args.rejectedItems : ["（なし）"]).join(" / ")}`,
+      `論点: ${JSON.stringify(args.openTopics)}`,
+      `質問ボード: ${JSON.stringify(args.ceoQuestions ?? [])}`,
+      `企画者発言: ${(args.proposerAnswers.length ? args.proposerAnswers : ["（なし）"]).join(" / ")}`,
+      `CEO整理: ${(args.chairNotes.length ? args.chairNotes : ["（なし）"]).join(" / ")}`,
       "",
       formatReviewLevelGuidance(args.reviewLevel),
-      formatMember(args.member),
+      formatConversationMember(args.member),
       formatCompany(args.company),
-      "## 提出時企画（参考のみ）",
-      formatProject(args.project),
-      "## これまでの会話（末尾）",
+      "## 会話末尾",
       JSON.stringify(args.transcript.slice(-16), null, 2),
       "",
-      "JSON:",
-      '{ "text": string, "addressTo": "proposer"|"officer"|"all", "addressRoleKey": string|null, "moveType": "question"|"counter"|"alternative"|"challenge_premise"|"expand"|"brake"|"accept"|"advance" }',
+      "JSON（textは会話文のみ。見出しや箇条書き禁止）:",
+      '{ "text": string, "targetType": "proposer"|"executive"|"chair"|"all"|"none", "targetParticipantId": string|null, "addressTo": "proposer"|"officer"|"all"|"none", "addressRoleKey": string|null, "moveType": "question"|"counter"|"alternative"|"challenge_premise"|"expand"|"brake"|"accept"|"advance" }',
     ].join("\n");
   },
 

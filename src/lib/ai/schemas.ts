@@ -641,7 +641,7 @@ export type IssueChairSummaryOutput = z.infer<typeof issueChairSummarySchema>;
 export type QualityBalancerOutput = z.infer<typeof qualityBalancerSchema>;
 
 const REVIEW_LIKE_BANNED =
-  /検討が必要|重要な論点|比較実験|マニュアルを作|不足しています|追加で検討|さらに調査/;
+  /検討が必要|重要な論点|比較実験|マニュアルを作|不足しています|追加で検討|さらに調査|良い点[：:]|懸念[：:]|改善案[：:]|期待効果[：:]|まとめ[：:]|^[-・*]\s|^\d+[\.、]/m;
 
 /** Chair picks next speaker dynamically (or asks proposer / proposes end). */
 export const discussionTopicStatusSchema = z.enum([
@@ -708,22 +708,37 @@ export const discussionFacilitatorSchema = z.object({
       .optional(),
   ),
   /**
-   * Single active discussion theme. Only one theme at a time.
-   * Sequence: profit → customer → operations → brand
+   * Current discussion theme label (free text). No fixed order.
+   * Example: 「利益性」「顧客体験」「運用負荷」
    */
   activeTheme: z.preprocess((value) => {
-    if (value === "" || value === undefined) return null;
-    return value;
-  }, z.enum(["profit", "customer", "operations", "brand"]).nullable().optional()),
+    if (value === "" || value === undefined || value === null) return null;
+    if (typeof value !== "string") return null;
+    return value.trim().slice(0, 40);
+  }, z.string().min(1).max(40).nullable().optional()),
   /**
-   * continue: stay on activeTheme
-   * park_aside: off-theme remark → park with 「後ほど」
-   * close_and_advance: declare theme done and move to next
+   * continue: stay on theme
+   * close_theme: declare theme organized; CEO picks next issue as theme
+   * (no fixed sequence — next theme is chosen by priority among unresolved issues)
    */
   themeAction: z.preprocess((value) => {
     if (value === "" || value === undefined) return "continue";
+    // Legacy park_aside → continue (perspectives that help the theme are allowed)
+    if (value === "park_aside" || value === "close_and_advance") {
+      return value === "close_and_advance" ? "close_theme" : "continue";
+    }
     return value;
-  }, z.enum(["continue", "park_aside", "close_and_advance"]).optional()),
+  }, z.enum(["continue", "close_theme"]).optional()),
+  /** Open issues under / around the current theme. Soft-capped. */
+  unresolvedIssues: z.preprocess(
+    (value) => (Array.isArray(value) ? value : []),
+    cappedArray(z.string().min(1).max(80), 12),
+  ),
+  /** Resolved issues. Soft-capped. */
+  resolvedIssues: z.preprocess(
+    (value) => (Array.isArray(value) ? value : []),
+    cappedArray(z.string().min(1).max(80), 12),
+  ),
   /**
    * Full CEO issue board (all unresolved + resolved). Soft-capped.
    * Meeting may propose_end only when every topic is resolved.
@@ -804,8 +819,17 @@ export const discussionBriefSummarySchema = z.object({
 export const discussionUtteranceSchema = z
   .object({
     text: z.string().min(1).max(150),
-    addressTo: z.enum(["proposer", "officer", "all"]),
-    addressRoleKey: z.string().nullable(),
+    /**
+     * Who this utterance is addressed to.
+     * Prefer targetType; addressTo kept for backward compatibility.
+     */
+    targetType: z
+      .enum(["proposer", "executive", "chair", "all", "none"])
+      .optional(),
+    /** roleKey when targetType === "executive" */
+    targetParticipantId: z.string().nullable().optional(),
+    addressTo: z.enum(["proposer", "officer", "all", "none"]).optional(),
+    addressRoleKey: z.string().nullable().optional(),
     moveType: z.enum([
       "question",
       "counter",
@@ -825,8 +849,16 @@ export const discussionUtteranceSchema = z
         code: "custom",
         path: ["text"],
         message:
-          "レビュー口調は禁止です。自然な質問・反論・別案・納得・次論点への前進に言い換えてください。",
+          "レビュー見出し・箇条書きは禁止です。自然な会話の一文に言い換えてください。",
       });
+    }
+    // Legacy models may omit both — allow; runtime normalizes.
+    if (
+      value.targetType === "executive" &&
+      !value.targetParticipantId &&
+      !value.addressRoleKey
+    ) {
+      // Soft: do not fail parse; normalizer may fill from text.
     }
   });
 

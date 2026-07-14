@@ -19,8 +19,14 @@ const bodySchema = z.object({
     "proceed",
     "confirm_end",
     "cancel_end",
+    "set_debugger_mode",
+    "debugger_repair",
+    "debugger_ignore",
   ]),
   note: z.string().max(300).optional(),
+  debuggerMode: z.enum(["OFF", "PASSIVE", "ACTIVE"]).optional(),
+  findingId: z.string().max(80).optional(),
+  repairAction: z.enum(["auto", "confirm", "ignore"]).optional(),
 });
 
 export async function POST(request: Request, { params }: Params) {
@@ -56,6 +62,9 @@ export async function POST(request: Request, { params }: Params) {
       action: parsed.data.action,
       reviewLevel,
       note: parsed.data.note,
+      debuggerMode: parsed.data.debuggerMode,
+      findingId: parsed.data.findingId,
+      repairAction: parsed.data.repairAction,
     });
     return NextResponse.json(result);
   } catch (error) {

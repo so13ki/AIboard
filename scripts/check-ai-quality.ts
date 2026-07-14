@@ -330,21 +330,47 @@ function testSchemas() {
       { id: "q3", text: "KPIは何を見る？", status: "ANSWERED", note: "継続率を見る" },
     ],
     routingKind: "brand",
-    activeTheme: "profit",
+    activeTheme: "利益性",
     themeAction: "continue",
+    unresolvedIssues: ["Premium人数予測", "収益モデル", "現場運用", "スタッフ教育", "KPI"],
+    resolvedIssues: ["開発費", "運用負荷"],
     decisions: ["紙運用", "マニュアルは作らない"],
     rejectedItems: ["アプリ化", "詳細マニュアル作成"],
     repetitionDetected: false,
   });
   assert.equal(fac.action, "nominate");
   assert.equal(fac.routingKind, "brand");
-  assert.equal(fac.activeTheme, "profit");
+  assert.equal(fac.activeTheme, "利益性");
   assert.equal(fac.themeAction, "continue");
+  assert.equal(fac.unresolvedIssues.length, 5);
+  assert.equal(fac.resolvedIssues[0], "開発費");
   assert.equal(fac.openTopics.filter((t) => t.status !== "resolved").length, 5);
   assert.equal(fac.priorityIssues.length, 4);
   assert.equal(fac.ceoQuestions.filter((q) => q.status === "RESOLVED").length, 1);
   assert.equal(fac.decisions.length, 2);
   assert.equal(fac.rejectedItems[0], "アプリ化");
+
+  // Legacy themeAction aliases still parse
+  const legacyClose = discussionFacilitatorSchema.parse({
+    action: "nominate",
+    nextSpeakerRoleKey: "cfo",
+    nominateReason: "次テーマへ",
+    chairUtterance: "利益性については概ね整理できました。",
+    endReason: null,
+    openTopics: [
+      { id: "price", label: "価格設定", status: "resolved", note: null },
+    ],
+    priorityIssues: [],
+    activeTheme: "顧客体験",
+    themeAction: "close_and_advance",
+    unresolvedIssues: ["顧客体験"],
+    resolvedIssues: ["利益性"],
+    decisions: [],
+    rejectedItems: [],
+    repetitionDetected: false,
+  });
+  assert.equal(legacyClose.themeAction, "close_theme");
+  assert.equal(legacyClose.activeTheme, "顧客体験");
 
   // Soft-cap: excess openIssues / priorityIssues truncate instead of failing
   const brief = discussionBriefSummarySchema.parse({

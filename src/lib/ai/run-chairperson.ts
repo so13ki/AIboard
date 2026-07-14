@@ -209,12 +209,13 @@ export async function runDiscussionFacilitator(args: {
   planVersions: unknown[];
   openTopics: unknown[];
   priorityIssues: string[];
+  unresolvedIssues: string[];
+  resolvedIssues: string[];
   ceoQuestions: unknown[];
   decisions: string[];
   rejectedItems: string[];
   lastSpeakerRoleKey?: string | null;
   activeTheme?: string | null;
-  closedThemes?: string[];
   signal?: AbortSignal;
 }): Promise<DiscussionFacilitatorOutput> {
   return generateStructuredJson({
@@ -232,12 +233,13 @@ export async function runDiscussionFacilitator(args: {
       planVersions: args.planVersions,
       openTopics: args.openTopics,
       priorityIssues: args.priorityIssues,
+      unresolvedIssues: args.unresolvedIssues,
+      resolvedIssues: args.resolvedIssues,
       ceoQuestions: args.ceoQuestions,
       decisions: args.decisions,
       rejectedItems: args.rejectedItems,
       lastSpeakerRoleKey: args.lastSpeakerRoleKey,
       activeTheme: args.activeTheme,
-      closedThemes: args.closedThemes,
     }),
     schema: discussionFacilitatorSchema,
     schemaName: "discussionFacilitator",
